@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import asyncio
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,9 @@ HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 HERMES_TIMEOUT_S = float(os.getenv("HERMES_TIMEOUT_S", "180"))
 LOG_DIR = Path(os.getenv("LOG_DIR", "/data/webhooks"))
 DEDUPE_SIZE = int(os.getenv("DEDUPE_SIZE", "5000"))
+DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "FX:XAUUSD")   # samakan dengan isi kolom symbol di DB
+DEFAULT_TF = os.getenv("DEFAULT_TF", "30S")
+MAX_ALERT_AGE_MIN = float(os.getenv("MAX_ALERT_AGE_MIN", "30"))
 POOL = ConnectionPool(os.environ["DATABASE_URL"], min_size=1, max_size=5, open=False)
 SCHEDULER = AsyncIOScheduler(timezone="UTC")
 
@@ -89,6 +93,8 @@ class Signal(_Base):
     stoch_rsi: dict[str, Any]
     macd: dict[str, Any]
 
+class StaleAlert(Exception):
+    pass
 
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
 _seen: "OrderedDict[str, None]" = OrderedDict()
@@ -105,6 +111,28 @@ def save_alert(p: dict, bar_time: datetime):
                ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING""",
             (p["symbol"], p["timeframe"], bar_time, Jsonb(p)),
         )
+
+def save_analysis(alert: dict, symbol: str, timeframe: str, content: str,
+                  latency_s: float, trigger_src: str) -> None:
+    parsed = parse_json_loose(content)
+    with POOL.connection() as conn:
+        conn.execute(
+            """INSERT INTO analyses
+               (alert_id, symbol, timeframe, bar_time, trigger_src, latency_s, response_raw, response)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (alert["id"], symbol, timeframe, alert["bar_time"], trigger_src,
+             latency_s, content, Jsonb(parsed) if parsed is not None else None),
+        )
+
+
+def parse_json_loose(text: str) -> dict | None:
+    """LLM kadang membungkus JSON dengan ```json ... ``` — bersihkan dulu."""
+    cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 def already_seen(event_id: str) -> bool:
     if event_id in _seen:
@@ -131,14 +159,35 @@ def client_ip(request: Request) -> str:
 def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
     with POOL.connection() as conn:
         row = conn.execute(
-            """SELECT payload, bar_time FROM alerts
+            """SELECT id, payload, bar_time FROM alerts
                WHERE symbol = %s AND timeframe = %s
                ORDER BY bar_time DESC LIMIT 1""",
             (symbol, timeframe),
         ).fetchone()
     if not row:
         return None
-    return {"payload": row[0], "bar_time": row[1]}
+    return {"id": row[0], "payload": row[1], "bar_time": row[2]}
+
+async def run_hermes_analysis(symbol: str = DEFAULT_SYMBOL, timeframe: str = DEFAULT_TF,
+                              trigger_src: str = "api") -> dict:
+    # fungsi DB sync → jalankan di thread supaya event loop tidak ke-block
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+    if not alert:
+        raise LookupError(f"Belum ada alert untuk {symbol}/{timeframe}")
+
+    age_min = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
+    if age_min > MAX_ALERT_AGE_MIN:
+        raise StaleAlert(f"Alert terakhir sudah {age_min:.0f} menit lalu, mungkin basi")
+
+    received_at = datetime.now(timezone.utc).isoformat()
+    content, latency = await forward_to_hermes(alert["payload"], received_at)
+    await asyncio.to_thread(save_analysis, alert, symbol, timeframe, content, latency, trigger_src)
+
+    return {
+        "symbol": symbol, "timeframe": timeframe,
+        "bar_time": alert["bar_time"].isoformat(), "age_minutes": round(age_min, 1),
+        "latency_s": latency, "raw": content, "plan": parse_json_loose(content),
+    }
 
 def cleanup_old_data():
     with POOL.connection() as conn:
@@ -148,18 +197,14 @@ def cleanup_old_data():
         log.info("cleanup: %d alerts dihapus", r1.rowcount)
 
 
-async def forward_to_hermes(payload: dict, received_at: str) -> None:
+async def forward_to_hermes(payload: dict, received_at: str) -> tuple[str, float]:
     headers = {"Content-Type": "application/json"}
     if HERMES_API_KEY:
         headers["Authorization"] = f"Bearer {HERMES_API_KEY}"
     body = {
         "model": HERMES_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": "TradingView signal payload:\n" + json.dumps(payload, ensure_ascii=False),
-            }
-        ],
+        "messages": [{"role": "user",
+                      "content": "TradingView signal payload:\n" + json.dumps(payload, ensure_ascii=False)}],
     }
     started = time.monotonic()
     try:
@@ -167,20 +212,16 @@ async def forward_to_hermes(payload: dict, received_at: str) -> None:
             r = await client.post(HERMES_URL, json=body, headers=headers)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
-        latency = round(time.monotonic() - started, 2)
-        append_jsonl("hermes", {
-            "received_at": received_at,
-            "event_id": payload.get("event_id"),
-            "latency_s": latency,
-            "payload": payload,
-            "response": content,
-        })
-        log.info("hermes ok event=%s latency=%ss", payload.get("event_id"), latency)
-        # TODO: risk layer deterministik (min R:R, daily loss cap, position size) di sini,
-        # SEBELUM hasil dipakai/diteruskan ke mana pun.
     except Exception as e:  # noqa: BLE001
         log.exception("hermes call failed")
         append_jsonl("errors", {"received_at": received_at, "payload": payload, "error": repr(e)})
+        raise                       # ← penting: biar caller (API/Telegram) tahu gagal
+
+    latency = round(time.monotonic() - started, 2)
+    append_jsonl("hermes", {"received_at": received_at, "event_id": payload.get("event_id"),
+                            "latency_s": latency, "payload": payload, "response": content})
+    log.info("hermes ok event=%s latency=%ss", payload.get("event_id"), latency)
+    return content, latency
 
 
 @asynccontextmanager
@@ -252,18 +293,24 @@ async def webhook(token: str, request: Request, bg: BackgroundTasks):
 
 
 @app.post("/analyze/{token}")
-async def analyze(token: str, bg: BackgroundTasks, symbol: str = "XAUUSD", timeframe: str = "15"):
+async def analyze(token: str, bg: BackgroundTasks,
+                  symbol: str = DEFAULT_SYMBOL, timeframe: str = DEFAULT_TF):
     if not hmac.compare_digest(token.encode(), ANALYZE_SECRET.encode()):
         raise HTTPException(status_code=404)
 
-    alert = fetch_latest_alert(symbol, timeframe)
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
     if not alert:
-        raise HTTPException(status_code=404, detail=f"Belum ada alert untuk {symbol}/{timeframe}")
+        raise HTTPException(404, f"Belum ada alert untuk {symbol}/{timeframe}")
+    age_min = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
+    if age_min > MAX_ALERT_AGE_MIN:
+        raise HTTPException(409, f"Alert terakhir sudah {age_min:.0f} menit lalu, mungkin basi")
 
-    age_minutes = (datetime.now(timezone.utc) - alert["bar_time"]).seconds / 60
-    if age_minutes > 30:
-        raise HTTPException(status_code=409, detail=f"Alert terakhir sudah {age_minutes:.0f} menit lalu, mungkin basi")
+    async def _job():
+        try:
+            await run_hermes_analysis(symbol, timeframe, trigger_src="api")
+        except Exception:  # noqa: BLE001
+            log.exception("analyze job failed")
 
-    received_at = datetime.now(timezone.utc).isoformat()
-    bg.add_task(forward_to_hermes, alert["payload"], received_at)
-    return {"status": "analyzing", "bar_time": alert["bar_time"].isoformat(), "age_minutes": round(age_minutes, 1)}
+    bg.add_task(_job)
+    return {"status": "analyzing", "bar_time": alert["bar_time"].isoformat(),
+            "age_minutes": round(age_min, 1)}
