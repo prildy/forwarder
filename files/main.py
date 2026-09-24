@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import asyncio
+import html
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,3 +315,121 @@ async def analyze(token: str, bg: BackgroundTasks,
     bg.add_task(_job)
     return {"status": "analyzing", "bar_time": alert["bar_time"].isoformat(),
             "age_minutes": round(age_min, 1)}
+
+# ===================== Telegram bot =====================
+TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+TG_ALLOWED = {int(x) for x in os.environ["TELEGRAM_ALLOWED_CHAT_IDS"].split(",") if x.strip()}
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+TG_MAX = 4000  # batas Telegram 4096, sisakan ruang
+
+_analysis_lock = asyncio.Lock()  # cegah dua analisa jalan bersamaan (tombol dipencet 2x)
+
+
+def analyze_button(symbol: str = DEFAULT_SYMBOL, tf: str = DEFAULT_TF) -> dict:
+    return {"inline_keyboard": [[
+        {"text": f"🔍 Analisa {symbol} {tf}", "callback_data": f"analyze|{symbol}|{tf}"}
+    ]]}
+
+
+async def tg(method: str, **payload) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{TG_API}/{method}", json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            log.warning("telegram %s gagal: %s", method, data)
+        return data
+    except Exception:  # noqa: BLE001
+        log.exception("telegram %s error", method)
+        return {"ok": False}
+
+
+async def tg_send(chat_id: int, text: str, **kw) -> None:
+    # pecah pesan panjang; tombol hanya di potongan terakhir
+    chunks = [text[i:i + TG_MAX] for i in range(0, len(text), TG_MAX)] or [""]
+    markup = kw.pop("reply_markup", None)
+    for i, chunk in enumerate(chunks):
+        extra = {"reply_markup": markup} if (markup and i == len(chunks) - 1) else {}
+        await tg("sendMessage", chat_id=chat_id, text=chunk, **kw, **extra)
+
+
+def format_plan(result: dict) -> str:
+    e = html.escape
+    head = (f"<b>{e(result['symbol'])} {e(result['timeframe'])}</b>\n"
+            f"Bar: {e(result['bar_time'])} ({result['age_minutes']} mnt lalu)\n"
+            f"Latency Hermes: {result['latency_s']}s\n\n")
+    plan = result.get("plan")
+    if plan is None:  # Hermes tidak mengembalikan JSON valid → tampilkan mentah
+        return head + e(result["raw"])
+    # Generik: tampilkan semua field top-level. Sesuaikan setelah struktur JSON-nya pasti.
+    lines = []
+    for k, v in plan.items():
+        val = v if isinstance(v, (str, int, float)) else json.dumps(v, ensure_ascii=False)
+        lines.append(f"<b>{e(str(k))}</b>: {e(str(val))}")
+    return head + "\n".join(lines)
+
+
+async def tg_do_analysis(chat_id: int, symbol: str, tf: str) -> None:
+    if _analysis_lock.locked():
+        await tg_send(chat_id, "⏳ Masih ada analisa yang berjalan, tunggu sebentar.")
+        return
+    async with _analysis_lock:
+        await tg_send(chat_id, f"⏳ Menganalisa {html.escape(symbol)} {html.escape(tf)}...")
+        try:
+            result = await run_hermes_analysis(symbol, tf, trigger_src="telegram")
+            text = format_plan(result)
+        except (LookupError, StaleAlert) as ex:
+            text = f"⚠️ {html.escape(str(ex))}"
+        except Exception as ex:  # noqa: BLE001
+            log.exception("telegram analysis failed")
+            text = f"❌ Analisa gagal: {html.escape(repr(ex))[:500]}"
+        await tg_send(chat_id, text, parse_mode="HTML", reply_markup=analyze_button(symbol, tf))
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request, bg: BackgroundTasks):
+    secret = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not hmac.compare_digest(secret.encode(), TG_SECRET.encode()):
+        raise HTTPException(status_code=403)
+
+    update = await request.json()
+
+    # --- tombol inline ---
+    if cq := update.get("callback_query"):
+        await tg("answerCallbackQuery", callback_query_id=cq["id"])
+        chat_id = cq.get("message", {}).get("chat", {}).get("id")
+        if chat_id in TG_ALLOWED and cq.get("data", "").startswith("analyze|"):
+            _, symbol, tf = cq["data"].split("|", 2)
+            bg.add_task(tg_do_analysis, chat_id, symbol, tf)
+        return {"ok": True}
+
+    # --- pesan / command ---
+    msg = update.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if chat_id not in TG_ALLOWED:
+        log.info("telegram: chat %s tidak diizinkan, diabaikan", chat_id)
+        return {"ok": True}
+
+    cmd, *args = text.split() or [""]
+    cmd = cmd.split("@")[0].lower()   # handle "/analyze@NamaBot"
+
+    if cmd == "/start":
+        await tg_send(chat_id, "Siap. Tekan tombol atau ketik /analyze [symbol] [tf].",
+                      reply_markup=analyze_button())
+    elif cmd == "/analyze":
+        symbol = args[0].upper() if len(args) > 0 else DEFAULT_SYMBOL
+        tf = args[1] if len(args) > 1 else DEFAULT_TF
+        bg.add_task(tg_do_analysis, chat_id, symbol, tf)
+    elif cmd == "/status":
+        alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
+        if alert:
+            age = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
+            await tg_send(chat_id, f"Alert terakhir {DEFAULT_SYMBOL} {DEFAULT_TF}: "
+                                   f"{alert['bar_time'].isoformat()} ({age:.0f} mnt lalu)",
+                          reply_markup=analyze_button())
+        else:
+            await tg_send(chat_id, "Belum ada alert tersimpan.")
+
+    return {"ok": True}
