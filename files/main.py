@@ -97,13 +97,13 @@ def migrate():
     with POOL.connection() as conn, open("schema.sql") as f:
         conn.execute(f.read())
 
-def save_alert(p: dict):
+def save_alert(p: dict, bar_time: datetime):
     with POOL.connection() as conn:
         conn.execute(
             """INSERT INTO alerts (symbol, timeframe, bar_time, payload)
-               VALUES (%s, %s, to_timestamp(%s / 1000.0), %s)
+               VALUES (%s, %s, %s, %s)
                ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING""",
-            (p["symbol"], p["timeframe"], p["bar_time"], Jsonb(p)),
+            (p["symbol"], p["timeframe"], bar_time, Jsonb(p)),
         )
 
 def already_seen(event_id: str) -> bool:
@@ -247,7 +247,7 @@ async def webhook(token: str, request: Request, bg: BackgroundTasks):
     payload.pop("secret", None)
 
     # Balas cepat (TradingView timeout ~3 detik);
-    bg.add_task(save_alert, payload)   # ← simpan ke DB
+    bg.add_task(save_alert, payload, signal.bar_time)  # ← simpan ke DB
     return {"status": "accepted", "event_id": signal.event_id}
 
 
