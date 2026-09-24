@@ -7,6 +7,9 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
+from psycopg_pool import ConnectionPool
+from psycopg.types.json import Jsonb
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -20,16 +23,11 @@ HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 HERMES_TIMEOUT_S = float(os.getenv("HERMES_TIMEOUT_S", "180"))
 LOG_DIR = Path(os.getenv("LOG_DIR", "/data/webhooks"))
 DEDUPE_SIZE = int(os.getenv("DEDUPE_SIZE", "5000"))
+POOL = ConnectionPool(os.environ["DATABASE_URL"], min_size=1, max_size=5, open=False)
 
 # IP resmi pengirim webhook TradingView
 TV_IPS = {"52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.7"}
 ENFORCE_TV_IPS = os.getenv("ENFORCE_TV_IPS", "false").lower() == "true"
-
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("forwarder")
-app = FastAPI()
-
 
 # --- Schema payload Pine Script (schema 2.0) ---
 class _Base(BaseModel):
@@ -92,6 +90,18 @@ class Signal(_Base):
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
 _seen: "OrderedDict[str, None]" = OrderedDict()
 
+def migrate():
+    with POOL.connection() as conn, open("schema.sql") as f:
+        conn.execute(f.read())
+
+def save_alert(p: dict):
+    with POOL.connection() as conn:
+        conn.execute(
+            """INSERT INTO alerts (symbol, timeframe, bar_time, payload)
+               VALUES (%s, %s, to_timestamp(%s / 1000.0), %s)
+               ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING""",
+            (p["symbol"], p["timeframe"], p["bar_time"], Jsonb(p)),
+        )
 
 def already_seen(event_id: str) -> bool:
     if event_id in _seen:
@@ -149,6 +159,19 @@ async def forward_to_hermes(payload: dict, received_at: str) -> None:
         log.exception("hermes call failed")
         append_jsonl("errors", {"received_at": received_at, "payload": payload, "error": repr(e)})
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    migrate()          # jalan saat startup
+    yield
+    POOL.close()       # jalan saat shutdown (opsional tapi bersih)
+
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("forwarder")
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
