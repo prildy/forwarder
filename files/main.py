@@ -10,12 +10,14 @@ from typing import Any, Literal, Optional
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
 from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 # --- Config (semua dari Railway env vars) ---
+ANALYZE_SECRET = os.environ["ANALYZE_SECRET"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 HERMES_URL = os.getenv("HERMES_URL", "http://hermes.railway.internal:8642/v1/chat/completions")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
@@ -24,6 +26,7 @@ HERMES_TIMEOUT_S = float(os.getenv("HERMES_TIMEOUT_S", "180"))
 LOG_DIR = Path(os.getenv("LOG_DIR", "/data/webhooks"))
 DEDUPE_SIZE = int(os.getenv("DEDUPE_SIZE", "5000"))
 POOL = ConnectionPool(os.environ["DATABASE_URL"], min_size=1, max_size=5, open=False)
+SCHEDULER = AsyncIOScheduler(timezone="UTC")
 
 # IP resmi pengirim webhook TradingView
 TV_IPS = {"52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.7"}
@@ -125,6 +128,26 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT payload, bar_time FROM alerts
+               WHERE symbol = %s AND timeframe = %s
+               ORDER BY bar_time DESC LIMIT 1""",
+            (symbol, timeframe),
+        ).fetchone()
+    if not row:
+        return None
+    return {"payload": row[0], "bar_time": row[1]}
+
+def cleanup_old_data():
+    with POOL.connection() as conn:
+        r1 = conn.execute(
+            "DELETE FROM alerts WHERE received_at < now() - INTERVAL '7 days'"
+        )
+        log.info("cleanup: %d alerts dihapus", r1.rowcount)
+
+
 async def forward_to_hermes(payload: dict, received_at: str) -> None:
     headers = {"Content-Type": "application/json"}
     if HERMES_API_KEY:
@@ -162,8 +185,15 @@ async def forward_to_hermes(payload: dict, received_at: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    migrate()          # jalan saat startup
+    POOL.open()
+    migrate()     
+    
+    SCHEDULER.add_job(cleanup_old_data, "cron", hour=2, minute=0)  # 09:00 WIB
+    SCHEDULER.start()
+
     yield
+
+    SCHEDULER.shutdown()
     POOL.close()       # jalan saat shutdown (opsional tapi bersih)
 
 
@@ -216,6 +246,24 @@ async def webhook(token: str, request: Request, bg: BackgroundTasks):
     # Jangan kirim field secret ke LLM
     payload.pop("secret", None)
 
-    # Balas cepat (TradingView timeout ~3 detik); panggilan LLM jalan di background
-    bg.add_task(forward_to_hermes, payload, received_at)
+    # Balas cepat (TradingView timeout ~3 detik);
+    bg.add_task(save_alert, payload)   # ← simpan ke DB
     return {"status": "accepted", "event_id": signal.event_id}
+
+
+@app.post("/analyze/{token}")
+async def analyze(token: str, bg: BackgroundTasks, symbol: str = "XAUUSD", timeframe: str = "15"):
+    if not hmac.compare_digest(token.encode(), ANALYZE_SECRET.encode()):
+        raise HTTPException(status_code=404)
+
+    alert = fetch_latest_alert(symbol, timeframe)
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Belum ada alert untuk {symbol}/{timeframe}")
+
+    age_minutes = (datetime.now(timezone.utc) - alert["bar_time"]).seconds / 60
+    if age_minutes > 30:
+        raise HTTPException(status_code=409, detail=f"Alert terakhir sudah {age_minutes:.0f} menit lalu, mungkin basi")
+
+    received_at = datetime.now(timezone.utc).isoformat()
+    bg.add_task(forward_to_hermes, alert["payload"], received_at)
+    return {"status": "analyzing", "bar_time": alert["bar_time"].isoformat(), "age_minutes": round(age_minutes, 1)}
