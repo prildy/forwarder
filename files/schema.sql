@@ -9,10 +9,17 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 
 CREATE TABLE IF NOT EXISTS analyses (
-  id             BIGSERIAL PRIMARY KEY,
-  requested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  alert_id       BIGINT REFERENCES alerts(id),
-  model          TEXT, prompt_version TEXT,
-  output         JSONB,           -- trading plan dari LLM
-  risk_verdict   JSONB            -- hasil cek R:R, daily loss cap, dll.
+    id           BIGSERIAL PRIMARY KEY,
+    alert_id     BIGINT REFERENCES alerts(id) ON DELETE SET NULL,
+    symbol       TEXT NOT NULL,
+    timeframe    TEXT NOT NULL,
+    bar_time     TIMESTAMPTZ NOT NULL,
+    trigger_src  TEXT NOT NULL,          -- 'api' | 'telegram'
+    latency_s    REAL,
+    response_raw TEXT NOT NULL,          -- teks mentah dari Hermes
+    response     JSONB,                  -- hasil parse JSON (NULL kalau gagal parse)
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS analyses_symbol_tf_created
+    ON analyses (symbol, timeframe, created_at DESC);
