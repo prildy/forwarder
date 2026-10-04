@@ -1,0 +1,10 @@
+.git
+.gitignore
+.DS_Store
+README.md
+config.snippet.yaml
+.env
+*.env
+# never ship local runtime/volume data into the image
+data/
+.hermes/

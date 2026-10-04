@@ -1,0 +1,10 @@
+# ONE-TIME SETUP (not auto-applied):
+# Merge this into /opt/data/config.yaml ON THE RAILWAY VOLUME.
+# It tells Hermes to ALSO scan the git-managed skills baked into the image
+# at /opt/skills-repo, in addition to the volume's own /opt/data/skills.
+# After this, pushing to GitHub rebuilds the image and the agent picks up
+# the new skill contents on next deploy. Verify the exact key against your
+# Hermes version (docs reference `skills.external_dirs`).
+skills:
+  external_dirs:
+    - /opt/skills-repo
