@@ -50,8 +50,10 @@ Optional (have defaults): `HERMES_URL`, `HERMES_API_KEY`, `HERMES_MODEL`, `HERME
 - **Volume `/opt/data`** holds runtime state (`.env`, `config.yaml`, `sessions/`, `memories/`, `skills/`, `logs/`) and is **not** in git. Secrets, port `8642`, `API_SERVER_ENABLED=true`, and private networking are configured in Railway, not here.
 - **One-time setup:** merge `config.snippet.yaml` (`skills.external_dirs: [/opt/skills-repo]`) into `/opt/data/config.yaml` on the volume, then restart. See `README.md`.
 
-### Known gotcha
-`skills/trading/bbma/SKILL.md` declares `name: bbma-playbook` but its folder is `bbma`. Keep folder name and `name:` aligned when adding/renaming skills.
+### Skills
+`skills/trading/`: `bbma`, `supply-demand-price-action-playbook`, `ict-smc-playbook`,
+`ichimoku-filter-playbook`, `momentum-filter-stochrsi-adx-di`, `trading-confluence-orchestrator`.
+Keep folder name and the frontmatter `name:` identical when adding/renaming skills.
 
 ---
 
