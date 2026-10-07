@@ -42,6 +42,28 @@ Optional (have defaults): `HERMES_URL`, `HERMES_API_KEY`, `HERMES_MODEL`, `HERME
 
 ---
 
+## `pine_script/` — alert payload (schema 2.1)
+
+`xauusd_pine` builds one compact JSON per confirmed bar and sends it via `alert()`.
+Blocks: `candle`, `bbma`, `ichimoku`, `liquidity_pools`, `vw_trend`, `smc`, `adx_di`,
+`stoch_rsi`, `momentum_filter`, `macd`, plus top-level `mtf` (M1/M5/M15 bias snapshots),
+`session`, and `bar_confirmed`.
+
+- **Hard limit: TradingView truncates the alert message at 4096 characters.** The JSON
+  currently runs ~3.7 KB — keep new fields under that ceiling or the tail is silently cut,
+  producing invalid JSON that the forwarder rejects (422). `mtf` is placed early (right
+  after `session`) so context survives if anything ever overflows.
+- To stay small: no duplicate-alias fields (use `bb_top`/`bb_low`, `price_vs_kumo`,
+  `kumo_direction`, `adx_state`, `di_bias`, `di_cross_state` — not the legacy twins), and
+  `momentum_filter` carries only `analysis_timeframe` + `bar_confirmed`; its `adx_di` and
+  `stoch_rsi` data live in the top-level blocks, not nested.
+- If the payload must grow past the ceiling, split into two alerts (context + signal)
+  rather than dropping MTF/structure fields.
+- **Editing the script means re-pasting it into TradingView and recreating the alert** —
+  TV runs the copy in its editor, not this repo file.
+
+---
+
 ## `hermes-config/` — Hermes agent image
 
 - **Build:** `railway.json` uses the `DOCKERFILE` builder. `Dockerfile` is `FROM nousresearch/hermes-agent:latest` + `COPY skills/ /opt/skills-repo/`.
