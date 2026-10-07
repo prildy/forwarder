@@ -25,6 +25,18 @@ HERMES_URL = os.getenv("HERMES_URL", "http://hermes.railway.internal:8642/v1/cha
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 HERMES_TIMEOUT_S = float(os.getenv("HERMES_TIMEOUT_S", "180"))
+# System prompt: arahkan agent ke trading-confluence-orchestrator & kontrak output JSON.
+HERMES_SYSTEM = os.getenv(
+    "HERMES_SYSTEM",
+    "You are a trading decision-support analyst for XAUUSD (paper-only, no broker "
+    "execution). Use the trading-confluence-orchestrator skill, which coordinates the "
+    "bbma, ict-smc, supply-demand, ichimoku, and momentum-filter skills. Base every "
+    "factual claim only on the payload (candle, bbma, ichimoku, liquidity_pools, "
+    "vw_trend, smc, adx_di, stoch_rsi, momentum_filter, macd, and the mtf multi-"
+    "timeframe block); never invent prices or states. Do not treat the 30S bar as a "
+    "standalone bias source — use the mtf block for higher-timeframe context. List any "
+    "absent fields under missing_data. Return valid JSON only, no Markdown fences.",
+)
 LOG_DIR = Path(os.getenv("LOG_DIR", "/data/webhooks"))
 DEDUPE_SIZE = int(os.getenv("DEDUPE_SIZE", "5000"))
 DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "FX:XAUUSD")   # samakan dengan isi kolom symbol di DB
@@ -74,7 +86,8 @@ class Smc(_Base):
 
 
 class Signal(_Base):
-    schema_version: Literal["2.0"] = Field(alias="schema")
+    # terima 2.0 (lama) dan 2.1 (schema diperkaya untuk semua skill Hermes)
+    schema_version: Literal["2.0", "2.1"] = Field(alias="schema")
     event_id: str = Field(min_length=1)
     source: Literal["tradingview"]
     symbol: str
@@ -93,6 +106,14 @@ class Signal(_Base):
     adx_di: dict[str, Any]
     stoch_rsi: dict[str, Any]
     macd: dict[str, Any]
+    # blok baru schema 2.1 (opsional supaya payload 2.0 lama tetap lolos):
+    # bar_confirmed + session dipakai orchestrator untuk data-quality gate,
+    # momentum_filter = blok gabungan yang diminta momentum skill,
+    # mtf = konteks multi-timeframe (semua skill melarang bias dari 30S saja).
+    bar_confirmed: Optional[bool] = None
+    session: Optional[str] = None
+    momentum_filter: dict[str, Any] = {}
+    mtf: dict[str, Any] = {}
 
 class StaleAlert(Exception):
     pass
@@ -202,10 +223,14 @@ async def forward_to_hermes(payload: dict, received_at: str) -> tuple[str, float
     headers = {"Content-Type": "application/json"}
     if HERMES_API_KEY:
         headers["Authorization"] = f"Bearer {HERMES_API_KEY}"
+    messages = []
+    if HERMES_SYSTEM:
+        messages.append({"role": "system", "content": HERMES_SYSTEM})
+    messages.append({"role": "user",
+                     "content": "TradingView signal payload:\n" + json.dumps(payload, ensure_ascii=False)})
     body = {
         "model": HERMES_MODEL,
-        "messages": [{"role": "user",
-                      "content": "TradingView signal payload:\n" + json.dumps(payload, ensure_ascii=False)}],
+        "messages": messages,
     }
     started = time.monotonic()
     try:

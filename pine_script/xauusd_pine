@@ -8,7 +8,7 @@ grpG = "General"
 secret   = input.string("", "Webhook secret", group = grpG)
 sendMode = input.string("Any signal", "Kirim alert saat", options = ["Any signal", "Every bar close"], group = grpG)
 atrLen   = input.int(14, "ATR length", minval = 1, group = grpG)
-SCHEMA   = "2.0"
+SCHEMA   = "2.1"
 PD       = 3   // desimal harga XAUUSD
 
 // ═══════════════════════════════════════════════════════════
@@ -35,6 +35,75 @@ fArr(array<string> items) =>
 atr = ta.atr(atrLen)
 
 // ═══════════════════════════════════════════════════════════
+// CONTEXT: sesi, volume, candle pattern  (dibutuhkan skill S/D + ICT)
+// ═══════════════════════════════════════════════════════════
+// Sesi FX berbasis jam UTC (konteks saja, bukan killzone — sesuai ICT skill)
+hUTC = hour(time, "UTC")
+sess = hUTC >= 0  and hUTC < 7  ? "asia" : hUTC >= 7  and hUTC < 12 ? "london" : hUTC >= 12 and hUTC < 16 ? "overlap" : hUTC >= 16 and hUTC < 21 ? "newyork" : "off"
+
+// Klasifikasi volume: spike / normal / low / unavailable (jangan mengarang spike)
+volAvg   = ta.sma(volume, 20)
+volState = na(volume) or na(volAvg) or volAvg == 0 ? "unavailable" : volume > volAvg * 1.5 ? "spike" : volume < volAvg * 0.6 ? "low" : "normal"
+
+// Candle pattern dasar (hanya yang deterministik; selain itu "none")
+cBody   = math.abs(close - open)
+cUpWick = high - math.max(open, close)
+cDnWick = math.min(open, close) - low
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+pinBull    = cBody > 0 and cDnWick > cBody * 2 and cUpWick < cBody
+pinBear    = cBody > 0 and cUpWick > cBody * 2 and cDnWick < cBody
+candlePattern = bullEngulf ? "bullish_engulfing" : bearEngulf ? "bearish_engulfing" : pinBull ? "bullish_pin" : pinBear ? "bearish_pin" : "none"
+
+// MA50/MA200 (BBMA skill memakai ini sebagai POI/TP context)
+ma50  = ta.sma(close, 50)
+ma200 = ta.sma(close, 200)
+
+// Previous day & session high/low → sumber liquidity pool untuk ICT skill
+[pdH, pdL] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+var float sessHi = na
+var float sessLo = na
+newSession = sess != sess[1]
+if newSession or na(sessHi)
+    sessHi := high
+    sessLo := low
+else
+    sessHi := math.max(sessHi, high)
+    sessLo := math.min(sessLo, low)
+
+// ═══════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME SNAPSHOT  (semua skill melarang bias dari 30S saja)
+// ═══════════════════════════════════════════════════════════
+biasStr(int v) =>
+    v == 1 ? "bullish" : v == -1 ? "bearish" : "neutral"
+
+mtfSnap() =>
+    e50 = ta.ema(close, 50)
+    tk  = math.avg(ta.lowest(9),  ta.highest(9))
+    kj  = math.avg(ta.lowest(26), ta.highest(26))
+    sa  = math.avg(tk, kj)
+    sb  = math.avg(ta.lowest(52), ta.highest(52))
+    cTop = math.max(sa[25], sb[25])
+    cBot = math.min(sa[25], sb[25])
+    [dP, dM, ax] = ta.dmi(14, 14)
+    emaBias   = close > e50 ? 1 : close < e50 ? -1 : 0
+    cloudBias = na(cTop) ? 0 : close > cTop ? 1 : close < cBot ? -1 : 0
+    diBias2   = dP > dM ? 1 : dP < dM ? -1 : 0
+    [emaBias, cloudBias, ax, diBias2]
+
+[m1Ema,  m1Cloud,  m1Adx,  m1Di]  = request.security(syminfo.tickerid, "1",  mtfSnap(), lookahead = barmerge.lookahead_off)
+[m5Ema,  m5Cloud,  m5Adx,  m5Di]  = request.security(syminfo.tickerid, "5",  mtfSnap(), lookahead = barmerge.lookahead_off)
+[m15Ema, m15Cloud, m15Adx, m15Di] = request.security(syminfo.tickerid, "15", mtfSnap(), lookahead = barmerge.lookahead_off)
+
+fMtfTf(int ema, int cloud, float ax, int di) =>
+    fObj(array.from(
+         fKV("ema50_bias", fStr(biasStr(ema))),
+         fKV("cloud_bias", fStr(biasStr(cloud))),
+         fKV("adx",        fNum(ax, 2)),
+         fKV("adx_state",  fStr(na(ax) ? "unknown" : ax >= 20 ? "trending" : "ranging")),
+         fKV("di_bias",    fStr(biasStr(di)))))
+
+// ═══════════════════════════════════════════════════════════
 // 1. BBMA (Bollinger Bands + MA5/10 High-Low + EMA50)
 // ═══════════════════════════════════════════════════════════
 grpB = "BBMA"
@@ -57,6 +126,32 @@ csmBuy      = close > bbUp and close[1] <= bbUp[1]
 csmSell     = close < bbLo and close[1] >= bbLo[1]
 reentryBuy  = bbmaTrend == "up" and low <= math.max(ma5L, ma10L) and close > math.min(ma5L, ma10L) and close > bbMid
 reentrySell = bbmaTrend == "down" and high >= math.min(ma5H, ma10H) and close < math.max(ma5H, ma10H) and close < bbMid
+
+// --- BBMA cycle state machine (Extreme → MHV → CSAK → Reentry → CSM) ---
+// State hanya diisi dari fakta deterministik; yang tak terbukti tetap "none"/"unknown".
+extremeState = extremeSell ? "top" : extremeBuy ? "bottom" : "none"
+// MHV = candle menyentuh BB mid (mid half value) setelah extreme
+mhvTouch = low <= bbMid and high >= bbMid
+mhvState = mhvTouch ? "valid" : "none"
+// CSAK (candle sideways/akumulasi di sekitar mid): body kecil & menyentuh mid
+csakState = mhvTouch and cBody < atr * 0.5 ? (close >= open ? "bullish" : "bearish") : "none"
+csmState  = csmBuy ? "bullish" : csmSell ? "bearish" : "none"
+
+// Reentry: hitung urutan (first / second / continuation) sejak extreme terakhir
+newExtreme   = (extremeBuy and not extremeBuy[1]) or (extremeSell and not extremeSell[1])
+reentryNow   = (reentryBuy and not reentryBuy[1]) or (reentrySell and not reentrySell[1])
+var int reentryCount = 0
+if newExtreme
+    reentryCount := 0
+if reentryNow
+    reentryCount += 1
+reentryState = reentryCount == 0 ? "none" : reentryCount == 1 ? "first" : reentryCount == 2 ? "second" : "continuation"
+
+barsSinceExtreme = ta.barssince(newExtreme)
+barsSinceMhv     = ta.barssince(mhvTouch)
+barsSinceReentry = ta.barssince(reentryNow)
+barsSinceCsm     = ta.barssince(csmBuy or csmSell)
+cycleDirection   = bbmaTrend == "up" ? "bullish" : bbmaTrend == "down" ? "bearish" : "unknown"
 
 // ═══════════════════════════════════════════════════════════
 // 2. ICHIMOKU
@@ -86,6 +181,17 @@ tkUp         = ta.crossover(tenkan, kijun)
 tkDn         = ta.crossunder(tenkan, kijun)
 tkCross      = tkUp ? "bullish" : tkDn ? "bearish" : "none"
 chikouPos    = close > high[disp] ? "above_price" : close < low[disp] ? "below_price" : "inside_price"
+
+// --- enrich untuk ichimoku-filter-playbook ---
+ichiProfile   = str.tostring(ichiConv) + "-" + str.tostring(ichiBase) + "-" + str.tostring(ichiSpB)
+kumoThickAtr  = na(cloudTop) or atr == 0 ? na : (cloudTop - cloudBot) / atr
+kumoThickState = na(kumoThickAtr) ? "unknown" : kumoThickAtr < 0.5 ? "thin" : kumoThickAtr < 1.5 ? "medium" : "thick"
+tenkanSlope   = tenkan > tenkan[1] ? "up" : tenkan < tenkan[1] ? "down" : "flat"
+kijunSlope    = kijun  > kijun[1]  ? "up" : kijun  < kijun[1]  ? "down" : "flat"
+tkCrossLoc    = na(cloudTop) ? "unknown" : tenkan > cloudTop and kijun > cloudTop ? "above_kumo" : tenkan < cloudBot and kijun < cloudBot ? "below_kumo" : "inside_kumo"
+tkVsKijun     = tkUp ? "bullish_cross" : tkDn ? "bearish_cross" : tenkan > kijun ? "bullish_aligned" : tenkan < kijun ? "bearish_aligned" : "neutral"
+chikouConf    = chikouPos == "above_price" ? "bullish_clear" : chikouPos == "below_price" ? "bearish_clear" : "neutral"
+kumoBreakout  = na(cloudTop) ? "unknown" : close > cloudTop and close[1] <= cloudTop[1] ? "bullish_confirmed" : close < cloudBot and close[1] >= cloudBot[1] ? "bearish_confirmed" : "none"
 
 // ═══════════════════════════════════════════════════════════
 // 3. LIQUIDITY POOLS (konsep: level swing yang belum di-sweep)
@@ -308,6 +414,13 @@ pdZone  = na(pdRange) or pdRange <= 0 ? "unknown" : close > eqLvl + 0.05 * pdRan
 
 structTrendS = structTrend == 1 ? "bullish" : structTrend == -1 ? "bearish" : "undefined"
 structEvent  = chochBull ? "choch_bullish" : bosBull ? "bos_bullish" : chochBear ? "choch_bearish" : bosBear ? "bos_bearish" : "none"
+// --- enrich SMC/ICT: scope, displacement, freshness, status ---
+// scope: swing besar (>3×ATR) dianggap external; selain itu internal (konteks LTF)
+structScope  = na(pdRange) or pdRange <= 0 ? "unknown" : pdRange > 3 * atr ? "external" : "internal"
+bullObState  = na(bullObTop) ? "unknown" : bullObMit ? "mitigated" : "fresh"
+bearObState  = na(bearObTop) ? "unknown" : bearObMit ? "mitigated" : "fresh"
+bullFvgStatus = na(bFvgTop) ? "unknown" : bFvgFilled ? "full_fill" : "fresh"
+bearFvgStatus = na(sFvgTop) ? "unknown" : sFvgFilled ? "full_fill" : "fresh"
 
 // ═══════════════════════════════════════════════════════════
 // 6. ADX & DI
@@ -323,6 +436,9 @@ diCross  = diBullX ? "bullish" : diBearX ? "bearish" : "none"
 adxState = adx >= adxTh ? "trending" : "ranging"
 adxSlope = adx > adx[1] ? "rising" : "falling"
 diDir    = diP > diM ? "bullish" : diP < diM ? "bearish" : "neutral"
+// state granular untuk momentum-filter skill
+adxStrength = na(adx) ? "unknown" : adx < adxTh ? (adx > adx[1] ? "developing" : "weak") : (adx > adx[1] ? "strong" : "weakening")
+diCrossState = diBullX ? "bullish_cross" : diBearX ? "bearish_cross" : "none"
 
 // ═══════════════════════════════════════════════════════════
 // 7. STOCHASTIC RSI
@@ -342,6 +458,9 @@ stBullX = ta.crossover(stK, stD)
 stBearX = ta.crossunder(stK, stD)
 stZone  = stK > stOB ? "overbought" : stK < stOS ? "oversold" : "neutral"
 stCross = stBullX ? "bullish" : stBearX ? "bearish" : "none"
+// zona & state granular untuk momentum-filter skill
+stZoneBand = na(stK) ? "unknown" : stK > 80 ? "above_80" : stK >= 50 ? "between_50_80" : stK >= 20 ? "between_20_50" : "below_20"
+stState    = stBullX and math.min(stK, stD) < stOS ? "bullish_reset" : stBearX and math.max(stK, stD) > stOB ? "bearish_reset" : stK > stOB ? "overbought" : stK < stOS ? "oversold" : "neutral"
 
 // ═══════════════════════════════════════════════════════════
 // 8. MACD + DIVERGENCES (regular & hidden)
@@ -451,37 +570,67 @@ candleJson = fObj(array.from(
      fKV("close",  fNum(close, PD)),
      fKV("volume", fNum(volume, 2)),
      fKV("volume_type", fStr(syminfo.volumetype)),
+     fKV("volume_state", fStr(volState)),
+     fKV("pattern", fStr(candlePattern)),
      fKV("atr",    fNum(atr, PD)),
      fKV("atr_len", str.tostring(atrLen))))
 
 bbmaJson = fObj(array.from(
      fKV("trend",        fStr(bbmaTrend)),
+     fKV("bb_params",    fStr(str.tostring(bbLen) + "-" + str.tostring(bbMult))),
      fKV("bb_upper",     fNum(bbUp,  PD)),
+     fKV("bb_top",       fNum(bbUp,  PD)),
      fKV("bb_mid",       fNum(bbMid, PD)),
      fKV("bb_lower",     fNum(bbLo,  PD)),
+     fKV("bb_low",       fNum(bbLo,  PD)),
      fKV("bb_width_pct", fNum(bbWidthPct, 3)),
      fKV("ma5_high",     fNum(ma5H,  PD)),
      fKV("ma10_high",    fNum(ma10H, PD)),
      fKV("ma5_low",      fNum(ma5L,  PD)),
      fKV("ma10_low",     fNum(ma10L, PD)),
      fKV("ema50",        fNum(ema50, PD)),
+     fKV("ma50",         fNum(ma50,  PD)),
+     fKV("ma200",        fNum(ma200, PD)),
      fKV("price_position", fStr(bbPos)),
      fKV("extreme_buy",  fBool(extremeBuy)),
      fKV("extreme_sell", fBool(extremeSell)),
      fKV("csm_buy",      fBool(csmBuy)),
      fKV("csm_sell",     fBool(csmSell)),
      fKV("reentry_buy",  fBool(reentryBuy)),
-     fKV("reentry_sell", fBool(reentrySell))))
+     fKV("reentry_sell", fBool(reentrySell)),
+     fKV("extreme_state",  fStr(extremeState)),
+     fKV("mhv_state",      fStr(mhvState)),
+     fKV("csak_state",     fStr(csakState)),
+     fKV("reentry_state",  fStr(reentryState)),
+     fKV("csm_state",      fStr(csmState)),
+     fKV("cycle_direction", fStr(cycleDirection)),
+     fKV("bars_since_extreme", na(barsSinceExtreme) ? "null" : str.tostring(barsSinceExtreme)),
+     fKV("bars_since_mhv",     na(barsSinceMhv)     ? "null" : str.tostring(barsSinceMhv)),
+     fKV("bars_since_reentry", na(barsSinceReentry) ? "null" : str.tostring(barsSinceReentry)),
+     fKV("bars_since_csm",     na(barsSinceCsm)     ? "null" : str.tostring(barsSinceCsm))))
 
 ichiJson = fObj(array.from(
+     fKV("parameter_profile", fStr(ichiProfile)),
      fKV("tenkan",         fNum(tenkan,   PD)),
      fKV("kijun",          fNum(kijun,    PD)),
+     fKV("span_a",         fNum(cloudA,   PD)),
+     fKV("span_b",         fNum(cloudB,   PD)),
      fKV("cloud_top",      fNum(cloudTop, PD)),
      fKV("cloud_bottom",   fNum(cloudBot, PD)),
+     fKV("kumo_thickness_atr",   na(kumoThickAtr) ? "null" : fNum(kumoThickAtr, 2)),
+     fKV("kumo_thickness_state", fStr(kumoThickState)),
      fKV("price_vs_cloud", fStr(priceVsCloud)),
+     fKV("price_vs_kumo",  fStr(priceVsCloud)),
      fKV("future_cloud",   fStr(futureCloud)),
+     fKV("kumo_direction", fStr(futureCloud)),
      fKV("tk_cross",       fStr(tkCross)),
-     fKV("chikou",         fStr(chikouPos))))
+     fKV("tenkan_vs_kijun", fStr(tkVsKijun)),
+     fKV("tk_cross_location", fStr(tkCrossLoc)),
+     fKV("tenkan_slope",   fStr(tenkanSlope)),
+     fKV("kijun_slope",    fStr(kijunSlope)),
+     fKV("chikou",         fStr(chikouPos)),
+     fKV("chikou_confirmation", fStr(chikouConf)),
+     fKV("kumo_breakout_state", fStr(kumoBreakout))))
 
 liqJson = fObj(array.from(
      fKV("bsl_nearest",     fNum(bslNear, PD)),
@@ -497,7 +646,11 @@ liqJson = fObj(array.from(
      fKV("ssl_swept_level", fNum(sslSweptLvl, PD)),
      fKV("ssl_taken",       fBool(sslTaken)),
      fKV("active_bsl",      str.tostring(array.size(bsl))),
-     fKV("active_ssl",      str.tostring(array.size(ssl)))))
+     fKV("active_ssl",      str.tostring(array.size(ssl))),
+     fKV("previous_day_high", fNum(pdH, PD)),
+     fKV("previous_day_low",  fNum(pdL, PD)),
+     fKV("session_high",      fNum(sessHi, PD)),
+     fKV("session_low",       fNum(sessLo, PD))))
 
 vwJson = fObj(array.from(
      fKV("trend",         fStr(vwTrendS)),
@@ -510,6 +663,8 @@ vwJson = fObj(array.from(
 smcJson = fObj(array.from(
      fKV("structure_trend",  fStr(structTrendS)),
      fKV("structure_event",  fStr(structEvent)),
+     fKV("structure_scope",  fStr(structScope)),
+     fKV("swing_len",        str.tostring(smcLen)),
      fKV("swing_high",       fNum(swHi, PD)),
      fKV("swing_low",        fNum(swLo, PD)),
      fKV("pd_zone",          fStr(pdZone)),
@@ -517,32 +672,62 @@ smcJson = fObj(array.from(
      fKV("bull_ob_top",      fNum(bullObTop, PD)),
      fKV("bull_ob_bottom",   fNum(bullObBot, PD)),
      fKV("bull_ob_mitigated", fBool(bullObMit)),
+     fKV("bull_ob_freshness", fStr(bullObState)),
+     fKV("bull_ob_displacement", fStr("bullish")),
      fKV("in_bull_ob",       fBool(inBullOb)),
      fKV("bear_ob_top",      fNum(bearObTop, PD)),
      fKV("bear_ob_bottom",   fNum(bearObBot, PD)),
      fKV("bear_ob_mitigated", fBool(bearObMit)),
+     fKV("bear_ob_freshness", fStr(bearObState)),
+     fKV("bear_ob_displacement", fStr("bearish")),
      fKV("in_bear_ob",       fBool(inBearOb)),
      fKV("bull_fvg_top",     fNum(bFvgTop, PD)),
      fKV("bull_fvg_bottom",  fNum(bFvgBot, PD)),
      fKV("bull_fvg_filled",  fBool(bFvgFilled)),
+     fKV("bull_fvg_status",  fStr(bullFvgStatus)),
      fKV("bear_fvg_top",     fNum(sFvgTop, PD)),
      fKV("bear_fvg_bottom",  fNum(sFvgBot, PD)),
-     fKV("bear_fvg_filled",  fBool(sFvgFilled))))
+     fKV("bear_fvg_filled",  fBool(sFvgFilled)),
+     fKV("bear_fvg_status",  fStr(bearFvgStatus))))
 
 adxJson = fObj(array.from(
+     fKV("length",    str.tostring(adxLen)),
+     fKV("threshold", fNum(adxTh, 2)),
      fKV("adx",       fNum(adx, 2)),
+     fKV("adx_prev",  fNum(adx[1], 2)),
      fKV("di_plus",   fNum(diP, 2)),
      fKV("di_minus",  fNum(diM, 2)),
      fKV("state",     fStr(adxState)),
+     fKV("adx_state", fStr(adxStrength)),
      fKV("adx_slope", fStr(adxSlope)),
      fKV("direction", fStr(diDir)),
-     fKV("di_cross",  fStr(diCross))))
+     fKV("di_bias",   fStr(diDir)),
+     fKV("di_cross",  fStr(diCross)),
+     fKV("di_cross_state", fStr(diCrossState))))
 
 stJson = fObj(array.from(
+     fKV("rsi_length",   str.tostring(srRsiLen)),
+     fKV("stoch_length", str.tostring(srStLen)),
+     fKV("smooth_k",     str.tostring(srK)),
+     fKV("smooth_d",     str.tostring(srD)),
      fKV("k",     fNum(stK, 2)),
      fKV("d",     fNum(stD, 2)),
      fKV("zone",  fStr(stZone)),
+     fKV("zone_band", fStr(stZoneBand)),
+     fKV("state", fStr(stState)),
      fKV("cross", fStr(stCross))))
+
+// Blok gabungan yang diminta eksplisit oleh momentum-filter skill
+momentumJson = fObj(array.from(
+     fKV("analysis_timeframe", fStr(timeframe.period)),
+     fKV("bar_confirmed", fBool(barstate.isconfirmed)),
+     fKV("adx_di",    adxJson),
+     fKV("stoch_rsi", stJson)))
+
+mtfJson = fObj(array.from(
+     fKV("m1",  fMtfTf(m1Ema,  m1Cloud,  m1Adx,  m1Di)),
+     fKV("m5",  fMtfTf(m5Ema,  m5Cloud,  m5Adx,  m5Di)),
+     fKV("m15", fMtfTf(m15Ema, m15Cloud, m15Adx, m15Di))))
 
 macdJson = fObj(array.from(
      fKV("macd",       fNum(macdLine, 4)),
@@ -563,6 +748,8 @@ json = fObj(array.from(
      fKV("timeframe",   fStr(timeframe.period)),
      fKV("bar_time",    fStr(str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC"))),
      fKV("bar_time_ms", str.tostring(time)),
+     fKV("bar_confirmed", fBool(barstate.isconfirmed)),
+     fKV("session",     fStr(sess)),
      fKV("triggers",    fArr(triggers)),
      fKV("candle",      candleJson),
      fKV("bbma",        bbmaJson),
@@ -572,7 +759,9 @@ json = fObj(array.from(
      fKV("smc",         smcJson),
      fKV("adx_di",      adxJson),
      fKV("stoch_rsi",   stJson),
-     fKV("macd",        macdJson)))
+     fKV("momentum_filter", momentumJson),
+     fKV("macd",        macdJson),
+     fKV("mtf",         mtfJson)))
 
 // ═══════════════════════════════════════════════════════════
 // ALERT — hanya di bar yang sudah close (anti-repaint)

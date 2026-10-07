@@ -9,7 +9,7 @@ from this repo, plus the Pine Script that generates the alerts.
 |---|---|---|
 | [`files/`](files/) | **forwarder** (webhook server) | Python FastAPI app that ingests TradingView webhooks, stores them in Postgres, and forwards them to the Hermes agent for analysis. Also runs a Telegram bot. |
 | [`hermes-config/`](hermes-config/) | **hermes** (agent) | Thin Docker image over `nousresearch/hermes-agent:latest` that bakes git-managed skills into `/opt/skills-repo`. |
-| `pine_script/` | — | TradingView Pine Script source that emits the schema-2.0 webhook payloads. Not deployed. |
+| `pine_script/` | — | TradingView Pine Script source that emits the schema-2.1 webhook payloads (MTF + enriched indicator blocks for the Hermes skills). Not deployed. |
 
 The two services talk over Railway **private networking**: the forwarder calls
 Hermes at `http://hermes.railway.internal:8642/v1/chat/completions` (an
@@ -27,13 +27,13 @@ OpenAI-compatible endpoint).
 - **Scheduled job:** daily cleanup of `alerts` older than 7 days (02:00 UTC / 09:00 WIB).
 
 ### Endpoints
-- `POST /webhook/{token}` — TradingView ingress. Secret is in the URL path (`WEBHOOK_SECRET`) because TradingView can't set custom headers. Validates against the Pydantic `Signal` model (schema 2.0), dedupes by `event_id`, saves to DB. Optional source-IP allowlist via `ENFORCE_TV_IPS`.
+- `POST /webhook/{token}` — TradingView ingress. Secret is in the URL path (`WEBHOOK_SECRET`) because TradingView can't set custom headers. Validates against the Pydantic `Signal` model (schema 2.0 or 2.1), dedupes by `event_id`, saves to DB. Optional source-IP allowlist via `ENFORCE_TV_IPS`.
 - `POST /analyze/{token}` — manual trigger (`ANALYZE_SECRET`); analyzes the latest stored alert.
 - `POST /telegram/webhook` — Telegram bot (`/analyze`, `/status`, `/start` + inline button). Verifies `x-telegram-bot-api-secret-token`; only chat IDs in `TELEGRAM_ALLOWED_CHAT_IDS` are allowed.
 
 ### Env vars (Railway)
 Required: `ANALYZE_SECRET`, `WEBHOOK_SECRET`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_ALLOWED_CHAT_IDS` (comma-separated).
-Optional (have defaults): `HERMES_URL`, `HERMES_API_KEY`, `HERMES_MODEL`, `HERMES_TIMEOUT_S`, `LOG_DIR`, `DEDUPE_SIZE`, `DEFAULT_SYMBOL`, `DEFAULT_TF`, `MAX_ALERT_AGE_MIN`, `ENFORCE_TV_IPS`.
+Optional (have defaults): `HERMES_URL`, `HERMES_API_KEY`, `HERMES_MODEL`, `HERMES_TIMEOUT_S`, `HERMES_SYSTEM` (system prompt routing Hermes to the `trading-confluence-orchestrator` skill), `LOG_DIR`, `DEDUPE_SIZE`, `DEFAULT_SYMBOL`, `DEFAULT_TF`, `MAX_ALERT_AGE_MIN`, `ENFORCE_TV_IPS`.
 
 ### Conventions
 - Keep everything in `main.py`; comments are in Indonesian — match that style.
