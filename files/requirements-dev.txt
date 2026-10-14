@@ -1,0 +1,3 @@
+# Dependensi khusus pengembangan/test — JANGAN masuk requirements.txt (itu yang
+# di-install Railway untuk server produksi). Install lokal: pip install -r requirements-dev.txt
+pytest==9.1.1
