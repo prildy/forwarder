@@ -1,1 +1,36 @@
+# OS
 .DS_Store
+
+# Local agent/tooling config
+.devx/
+.mcp.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local env (Railway injects real env vars at runtime)
+.env
+.env.*
+!.env.example
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/
+
+# Runtime logs/data (forwarder LOG_DIR, if ever pointed at a local path)
+data/
+*.log
