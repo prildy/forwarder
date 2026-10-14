@@ -23,3 +23,26 @@ CREATE TABLE IF NOT EXISTS analyses (
 
 CREATE INDEX IF NOT EXISTS analyses_symbol_tf_created
     ON analyses (symbol, timeframe, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS journal (
+  id            BIGSERIAL PRIMARY KEY,
+  alert_id      BIGINT REFERENCES alerts(id)   ON DELETE SET NULL,
+  analysis_id   BIGINT REFERENCES analyses(id) ON DELETE SET NULL,
+  symbol        TEXT NOT NULL,
+  timeframe     TEXT NOT NULL,
+  mode          TEXT NOT NULL DEFAULT 'live',   -- 'live' | 'forward' | 'backtest'
+  direction     TEXT NOT NULL,                  -- 'long' | 'short'
+  entry         NUMERIC NOT NULL,
+  stop_loss     NUMERIC NOT NULL,
+  take_profit   NUMERIC NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'open',   -- open|win|loss|breakeven|skipped
+  exit_price    NUMERIC,
+  r_multiple    NUMERIC,
+  opened_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at     TIMESTAMPTZ,
+  setup_tags    TEXT[] DEFAULT '{}',
+  lesson        TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS journal_mode_symbol_status ON journal (mode, symbol, status);
+CREATE INDEX IF NOT EXISTS journal_open ON journal (status) WHERE status = 'open';
