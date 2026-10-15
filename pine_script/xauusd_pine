@@ -578,10 +578,8 @@ candleJson = fObj(array.from(
 bbmaJson = fObj(array.from(
      fKV("trend",        fStr(bbmaTrend)),
      fKV("bb_params",    fStr(str.tostring(bbLen) + "-" + str.tostring(bbMult))),
-     fKV("bb_upper",     fNum(bbUp,  PD)),
      fKV("bb_top",       fNum(bbUp,  PD)),
      fKV("bb_mid",       fNum(bbMid, PD)),
-     fKV("bb_lower",     fNum(bbLo,  PD)),
      fKV("bb_low",       fNum(bbLo,  PD)),
      fKV("bb_width_pct", fNum(bbWidthPct, 3)),
      fKV("ma5_high",     fNum(ma5H,  PD)),
@@ -619,9 +617,7 @@ ichiJson = fObj(array.from(
      fKV("cloud_bottom",   fNum(cloudBot, PD)),
      fKV("kumo_thickness_atr",   na(kumoThickAtr) ? "null" : fNum(kumoThickAtr, 2)),
      fKV("kumo_thickness_state", fStr(kumoThickState)),
-     fKV("price_vs_cloud", fStr(priceVsCloud)),
      fKV("price_vs_kumo",  fStr(priceVsCloud)),
-     fKV("future_cloud",   fStr(futureCloud)),
      fKV("kumo_direction", fStr(futureCloud)),
      fKV("tk_cross",       fStr(tkCross)),
      fKV("tenkan_vs_kijun", fStr(tkVsKijun)),
@@ -697,12 +693,9 @@ adxJson = fObj(array.from(
      fKV("adx_prev",  fNum(adx[1], 2)),
      fKV("di_plus",   fNum(diP, 2)),
      fKV("di_minus",  fNum(diM, 2)),
-     fKV("state",     fStr(adxState)),
      fKV("adx_state", fStr(adxStrength)),
      fKV("adx_slope", fStr(adxSlope)),
-     fKV("direction", fStr(diDir)),
      fKV("di_bias",   fStr(diDir)),
-     fKV("di_cross",  fStr(diCross)),
      fKV("di_cross_state", fStr(diCrossState))))
 
 stJson = fObj(array.from(
@@ -717,12 +710,11 @@ stJson = fObj(array.from(
      fKV("state", fStr(stState)),
      fKV("cross", fStr(stCross))))
 
-// Blok gabungan yang diminta eksplisit oleh momentum-filter skill
+// Konteks momentum-filter. adx_di & stoch_rsi TIDAK digandakan di sini
+// (ada di top-level payload) demi hemat ukuran — batas pesan alert TV 4096 char.
 momentumJson = fObj(array.from(
      fKV("analysis_timeframe", fStr(timeframe.period)),
-     fKV("bar_confirmed", fBool(barstate.isconfirmed)),
-     fKV("adx_di",    adxJson),
-     fKV("stoch_rsi", stJson)))
+     fKV("bar_confirmed", fBool(barstate.isconfirmed))))
 
 mtfJson = fObj(array.from(
      fKV("m1",  fMtfTf(m1Ema,  m1Cloud,  m1Adx,  m1Di)),
@@ -750,6 +742,7 @@ json = fObj(array.from(
      fKV("bar_time_ms", str.tostring(time)),
      fKV("bar_confirmed", fBool(barstate.isconfirmed)),
      fKV("session",     fStr(sess)),
+     fKV("mtf",         mtfJson),
      fKV("triggers",    fArr(triggers)),
      fKV("candle",      candleJson),
      fKV("bbma",        bbmaJson),
@@ -760,8 +753,7 @@ json = fObj(array.from(
      fKV("adx_di",      adxJson),
      fKV("stoch_rsi",   stJson),
      fKV("momentum_filter", momentumJson),
-     fKV("macd",        macdJson),
-     fKV("mtf",         mtfJson)))
+     fKV("macd",        macdJson)))
 
 // ═══════════════════════════════════════════════════════════
 // ALERT — hanya di bar yang sudah close (anti-repaint)

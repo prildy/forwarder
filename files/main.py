@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
+from psycopg import errors as pg_errors
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+import resolver
 
 # --- Config (semua dari Railway env vars) ---
 ANALYZE_SECRET = os.environ["ANALYZE_SECRET"]
@@ -26,6 +29,9 @@ HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 HERMES_TIMEOUT_S = float(os.getenv("HERMES_TIMEOUT_S", "180"))
 # System prompt: arahkan agent ke trading-confluence-orchestrator & kontrak output JSON.
+# Kontrak JSON di bawah dikonsumsi dua konsumen: tampilan /analyze Telegram (format_plan)
+# dan forward auto-capture (parse_hermes_decision). Jangan ubah nama field tanpa update
+# kedua konsumen itu.
 HERMES_SYSTEM = os.getenv(
     "HERMES_SYSTEM",
     "You are a trading decision-support analyst for XAUUSD (paper-only, no broker "
@@ -35,7 +41,19 @@ HERMES_SYSTEM = os.getenv(
     "vw_trend, smc, adx_di, stoch_rsi, momentum_filter, macd, and the mtf multi-"
     "timeframe block); never invent prices or states. Do not treat the 30S bar as a "
     "standalone bias source — use the mtf block for higher-timeframe context. List any "
-    "absent fields under missing_data. Return valid JSON only, no Markdown fences.",
+    "absent fields under missing_data. "
+    "You MUST return a single JSON object and nothing else — no prose, no Markdown "
+    "fences, no code blocks. The object MUST have exactly these keys: "
+    '"decision" (one of "long", "short", "no_trade"), '
+    '"entry" (number or null), "stop_loss" (number or null), '
+    '"take_profit" (number or null), "confidence" (number 0.0-1.0), '
+    '"setup_tags" (array of strings), "rationale" (short string), '
+    '"missing_data" (array of strings). '
+    "When decision is \"long\" or \"short\", entry/stop_loss/take_profit MUST be numbers "
+    "drawn from the payload levels, with sl and tp on the correct sides of entry "
+    "(long: sl < entry < tp; short: tp < entry < sl). When decision is \"no_trade\", set "
+    "entry/stop_loss/take_profit to null. confidence reflects how strong the confluence "
+    "is for the stated decision.",
 )
 LOG_DIR = Path(os.getenv("LOG_DIR", "/data/webhooks"))
 DEDUPE_SIZE = int(os.getenv("DEDUPE_SIZE", "5000"))
@@ -48,6 +66,18 @@ SCHEDULER = AsyncIOScheduler(timezone="UTC")
 # IP resmi pengirim webhook TradingView
 TV_IPS = {"52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.7"}
 ENFORCE_TV_IPS = os.getenv("ENFORCE_TV_IPS", "false").lower() == "true"
+
+# --- Forward auto-capture (Hermes-driven forward test) ---
+# Master switch: kalau false, webhook cuma simpan alert (persis seperti sebelumnya),
+# tidak ada panggilan Hermes dan tidak ada jurnal yang dibuat.
+FORWARD_AUTOCAPTURE = os.getenv("FORWARD_AUTOCAPTURE", "false").lower() == "true"
+# Daftar trigger yang memenuhi syarat (comma-separated). Kosong = trigger apa pun asal
+# daftar triggers di payload tidak kosong. Ini keputusan kebijakan trading user.
+FORWARD_TRIGGERS = {
+    t.strip() for t in os.getenv("FORWARD_TRIGGERS", "").split(",") if t.strip()
+}
+# Ambang confidence minimum dari Hermes; di bawah ini capture dilewati.
+FORWARD_MIN_CONFIDENCE = float(os.getenv("FORWARD_MIN_CONFIDENCE", "0.6"))
 
 # --- Schema payload Pine Script (schema 2.0) ---
 class _Base(BaseModel):
@@ -118,6 +148,16 @@ class Signal(_Base):
 class StaleAlert(Exception):
     pass
 
+
+class ForwardTradeExists(Exception):
+    """Partial unique index menolak forward trade KEDUA yang open untuk symbol+tf.
+
+    Dipakai sebagai guard anti-pyramiding tingkat DB (lihat journal_one_open_forward di
+    schema.sql): dilempar create_journal_entry saat INSERT forward kena unique violation,
+    lalu ditangani rapi oleh pemanggil (auto-capture & command manual) — bukan error 500.
+    """
+    pass
+
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
 _seen: "OrderedDict[str, None]" = OrderedDict()
 
@@ -156,6 +196,53 @@ def parse_json_loose(text: str) -> dict | None:
     except json.JSONDecodeError:
         return None
 
+def _coerce_float(value: Any) -> float | None:
+    # Level harga harus angka; string "na"/null/teks → None supaya gate di hulu aman.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def parse_hermes_decision(content: str) -> dict | None:
+    """Normalkan respons Hermes jadi dict keputusan trade, atau None kalau tak terpakai.
+
+    Defensif: confidence hilang/na → 0.0; level non-numerik → None. Field decision wajib
+    salah satu dari long/short/no_trade; selain itu dianggap tak terpakai (None).
+    """
+    parsed = parse_json_loose(content)
+    if parsed is None:
+        return None
+
+    decision = parsed.get("decision")
+    if not isinstance(decision, str) or decision.lower() not in ("long", "short", "no_trade"):
+        return None
+
+    confidence = _coerce_float(parsed.get("confidence"))
+    if confidence is None:
+        confidence = 0.0
+
+    setup_tags = parsed.get("setup_tags")
+    if not isinstance(setup_tags, list):
+        setup_tags = []
+    setup_tags = [str(tag) for tag in setup_tags if isinstance(tag, (str, int, float))]
+
+    return {
+        "decision": decision.lower(),
+        "entry": _coerce_float(parsed.get("entry")),
+        "stop_loss": _coerce_float(parsed.get("stop_loss")),
+        "take_profit": _coerce_float(parsed.get("take_profit")),
+        "confidence": confidence,
+        "setup_tags": setup_tags,
+    }
+
+
 def already_seen(event_id: str) -> bool:
     if event_id in _seen:
         return True
@@ -190,6 +277,172 @@ def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
         return None
     return {"id": row[0], "payload": row[1], "bar_time": row[2]}
 
+# ===================== Trade journal (DB helpers) =====================
+# Semua fungsi di sini sinkron (pakai POOL) → dipanggil lewat asyncio.to_thread.
+
+
+def classify_r(r_multiple: float) -> str:
+    # Breakeven kalau R mendekati nol; kecuali itu menang/kalah dari tanda R.
+    if abs(r_multiple) < 0.05:
+        return "breakeven"
+    return "win" if r_multiple > 0 else "loss"
+
+
+def create_journal_entry(symbol: str, timeframe: str, mode: str, direction: str,
+                         entry: float, stop_loss: float, take_profit: float,
+                         setup_tags: list[str], alert_id: int | None,
+                         analysis_id: int | None) -> int:
+    # Partial unique index journal_one_open_forward adalah penjamin anti-pyramiding yang
+    # sebenarnya (pre-check has_open_forward_trade cuma fast-path). Kalau dua webhook
+    # bersamaan lolos pre-check lalu sama-sama insert forward, INSERT kedua kena
+    # UniqueViolation → ubah jadi exception domain yang ditangani rapi oleh pemanggil.
+    try:
+        with POOL.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO journal
+                   (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
+                    setup_tags, alert_id, analysis_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
+                 setup_tags, alert_id, analysis_id),
+            ).fetchone()
+    except pg_errors.UniqueViolation as exc:
+        raise ForwardTradeExists(
+            f"Sudah ada forward trade terbuka untuk {symbol}/{timeframe}"
+        ) from exc
+    return row[0]
+
+
+def has_open_forward_trade(symbol: str, timeframe: str) -> bool:
+    # Anti-pyramiding: cek apakah masih ada forward trade open untuk symbol+tf ini.
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM journal
+               WHERE mode = 'forward' AND symbol = %s AND timeframe = %s
+                 AND status = 'open'
+               LIMIT 1""",
+            (symbol, timeframe),
+        ).fetchone()
+    return row is not None
+
+
+def fetch_journal(journal_id: int) -> dict | None:
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT id, symbol, timeframe, direction, entry, stop_loss, take_profit, status
+               FROM journal WHERE id = %s""",
+            (journal_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "symbol": row[1], "timeframe": row[2], "direction": row[3],
+            "entry": row[4], "stop_loss": row[5], "take_profit": row[6], "status": row[7]}
+
+
+def close_journal_entry(journal_id: int, exit_price: float, r_multiple: float,
+                        status: str, lesson: str | None) -> bool:
+    # WHERE status='open' bikin idempoten: baris yang sudah tertutup tidak tersentuh.
+    with POOL.connection() as conn:
+        result = conn.execute(
+            """UPDATE journal
+               SET exit_price = %s, r_multiple = %s, status = %s, lesson = %s, closed_at = now()
+               WHERE id = %s AND status = 'open'""",
+            (exit_price, r_multiple, status, lesson, journal_id),
+        )
+    return result.rowcount > 0
+
+
+def resolve_open_trades() -> int:
+    # Auto-resolve murni dari bar alerts yang sudah tersimpan — tanpa panggilan eksternal.
+    # Keputusan SL/TP didelegasikan ke modul resolver (sumber kebenaran tunggal, dipakai
+    # juga oleh backtest.py) supaya logika live & backtest mustahil menyimpang.
+    # HANYA mode live/forward: baris mode='backtest' diresolusi khusus oleh backtest.py
+    # (opened_at-nya waktu historis, menelusuri bar live di sini bisa salah menutupnya).
+    resolved = 0
+    with POOL.connection() as conn:
+        open_trades = conn.execute(
+            """SELECT id, symbol, timeframe, direction, entry, stop_loss, take_profit, opened_at
+               FROM journal
+               WHERE status = 'open' AND mode IN ('live', 'forward')"""
+        ).fetchall()
+
+        for trade in open_trades:
+            (journal_id, symbol, timeframe, direction, entry,
+             stop_loss, take_profit, opened_at) = trade
+
+            # Ambil high/low tiap bar setelah entry, urut waktu naik.
+            bar_rows = conn.execute(
+                """SELECT bar_time,
+                          (payload->'candle'->>'high')::numeric AS high,
+                          (payload->'candle'->>'low')::numeric  AS low
+                   FROM alerts
+                   WHERE symbol = %s AND timeframe = %s AND bar_time > %s
+                   ORDER BY bar_time ASC""",
+                (symbol, timeframe, opened_at),
+            ).fetchall()
+
+            bars = [resolver.PriceBar(bar_time=row[0], high=row[1], low=row[2])
+                    for row in bar_rows]
+            outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
+
+            if outcome.is_open:
+                # Risk nol (entry == sl) di-guard resolver jadi open — catat biar kelihatan.
+                if entry == stop_loss:
+                    log.warning("journal %s: risk nol (entry == sl), lewati auto-resolve",
+                                journal_id)
+                continue
+
+            conn.execute(
+                """UPDATE journal
+                   SET status = %s, exit_price = %s, r_multiple = %s, closed_at = %s
+                   WHERE id = %s AND status = 'open'""",
+                (outcome.status, outcome.exit_price, outcome.r_multiple,
+                 outcome.closed_at, journal_id),
+            )
+            resolved += 1
+    return resolved
+
+
+def fetch_open_trades(limit: int = 20) -> list[dict]:
+    with POOL.connection() as conn:
+        rows = conn.execute(
+            """SELECT id, mode, symbol, timeframe, direction, entry, stop_loss, take_profit, opened_at
+               FROM journal WHERE status = 'open'
+               ORDER BY opened_at DESC LIMIT %s""",
+            (limit,),
+        ).fetchall()
+    return [
+        {"id": r[0], "mode": r[1], "symbol": r[2], "timeframe": r[3], "direction": r[4],
+         "entry": r[5], "stop_loss": r[6], "take_profit": r[7], "opened_at": r[8]}
+        for r in rows
+    ]
+
+
+def journal_stats(symbol: str, mode: str) -> dict:
+    # Agregat per symbol+mode: hitung menang/kalah/BE dan rata-rata R trade yang sudah selesai.
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT
+                 count(*) FILTER (WHERE status = 'win')       AS wins,
+                 count(*) FILTER (WHERE status = 'loss')      AS losses,
+                 count(*) FILTER (WHERE status = 'breakeven') AS breakevens,
+                 count(*) FILTER (WHERE status = 'open')      AS opens,
+                 avg(r_multiple) FILTER (WHERE status IN ('win', 'loss', 'breakeven')) AS avg_r
+               FROM journal WHERE symbol = %s AND mode = %s""",
+            (symbol, mode),
+        ).fetchone()
+    wins, losses, breakevens, opens, avg_r = row
+    closed = wins + losses + breakevens
+    win_rate = (wins / closed * 100) if closed else 0.0
+    return {
+        "symbol": symbol, "mode": mode,
+        "wins": wins, "losses": losses, "breakevens": breakevens, "opens": opens,
+        "win_rate": round(win_rate, 1),
+        "avg_r": round(float(avg_r), 2) if avg_r is not None else None,
+    }
+
+
 async def run_hermes_analysis(symbol: str = DEFAULT_SYMBOL, timeframe: str = DEFAULT_TF,
                               trigger_src: str = "api") -> dict:
     # fungsi DB sync → jalankan di thread supaya event loop tidak ke-block
@@ -211,12 +464,117 @@ async def run_hermes_analysis(symbol: str = DEFAULT_SYMBOL, timeframe: str = DEF
         "latency_s": latency, "raw": content, "plan": parse_json_loose(content),
     }
 
+def _triggers_qualify(triggers: list[str]) -> bool:
+    # Kosongnya FORWARD_TRIGGERS artinya "trigger apa pun asal daftar tidak kosong".
+    if not triggers:
+        return False
+    if not FORWARD_TRIGGERS:
+        return True
+    return bool(set(triggers) & FORWARD_TRIGGERS)
+
+
+def _levels_sane(direction: str, entry: float, stop_loss: float, take_profit: float) -> bool:
+    # long: sl < entry < tp; short: tp < entry < sl.
+    if direction == "long":
+        return stop_loss < entry < take_profit
+    return take_profit < entry < stop_loss
+
+
+async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
+    """Hermes-driven forward test: dari satu signal live, minta keputusan ke Hermes,
+    lalu kalau layak buat jurnal mode='forward' yang nanti ditutup resolver 1 menit.
+
+    Seluruh badan dibungkus try/except: kegagalan apa pun (Hermes mati, parse jelek)
+    dicatat lalu ditelan — tidak boleh mengganggu ingesti webhook.
+    """
+    if not FORWARD_AUTOCAPTURE:
+        return
+
+    try:
+        symbol = payload.get("symbol")
+        timeframe = payload.get("timeframe")
+        # Gate instrumen utama: forward-capture hanya untuk DEFAULT_SYMBOL/DEFAULT_TF.
+        if symbol != DEFAULT_SYMBOL or timeframe != DEFAULT_TF:
+            log.debug("autocapture skip: symbol/tf bukan primary (%s/%s)", symbol, timeframe)
+            return
+
+        triggers = payload.get("triggers") or []
+        if not _triggers_qualify(triggers):
+            log.debug("autocapture skip: triggers tidak memenuhi filter (%s)", triggers)
+            return
+
+        # Anti-pyramiding: satu forward trade open per symbol+tf.
+        if await asyncio.to_thread(has_open_forward_trade, symbol, timeframe):
+            log.info("autocapture skip: masih ada forward trade open %s/%s", symbol, timeframe)
+            return
+
+        received_at = datetime.now(timezone.utc).isoformat()
+        content, _ = await forward_to_hermes(payload, received_at)
+        decision = parse_hermes_decision(content)
+        if decision is None:
+            log.info("autocapture skip: respons Hermes tak terparse jadi keputusan")
+            return
+
+        if decision["decision"] not in ("long", "short"):
+            log.info("autocapture skip: decision=%s (no_trade)", decision["decision"])
+            return
+
+        if decision["confidence"] < FORWARD_MIN_CONFIDENCE:
+            log.info("autocapture skip: confidence %.2f < %.2f",
+                     decision["confidence"], FORWARD_MIN_CONFIDENCE)
+            return
+
+        entry = decision["entry"]
+        stop_loss = decision["stop_loss"]
+        take_profit = decision["take_profit"]
+        if entry is None or stop_loss is None or take_profit is None:
+            log.info("autocapture skip: level entry/sl/tp tidak lengkap")
+            return
+
+        if not _levels_sane(decision["decision"], entry, stop_loss, take_profit):
+            log.info("autocapture skip: level tidak masuk akal utk %s (e=%s sl=%s tp=%s)",
+                     decision["decision"], entry, stop_loss, take_profit)
+            return
+
+        # Tautkan alert terbaru (yang baru saja disimpan) sebagai konteks jurnal.
+        alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+        alert_id = alert["id"] if alert else None
+
+        setup_tags = decision["setup_tags"] or list(triggers)
+        journal_id = await asyncio.to_thread(
+            create_journal_entry, symbol, timeframe, "forward", decision["decision"],
+            entry, stop_loss, take_profit, setup_tags, alert_id, None,
+        )
+        log.info("autocapture: jurnal forward #%s dibuat %s e=%s sl=%s tp=%s conf=%.2f",
+                 journal_id, decision["decision"], entry, stop_loss, take_profit,
+                 decision["confidence"])
+    except ForwardTradeExists:
+        # Race: webhook lain sudah buka forward trade duluan (unique index menolak).
+        log.info("autocapture skip: sudah ada forward trade terbuka, lewati")
+    except Exception:  # noqa: BLE001
+        log.exception("autocapture gagal (diabaikan, webhook tetap aman)")
+
+
+async def ingest_signal(payload: dict, bar_time: datetime) -> None:
+    # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
+    # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
+    await asyncio.to_thread(save_alert, payload, bar_time)
+    await forward_autocapture(payload, bar_time)
+
+
 def cleanup_old_data():
     with POOL.connection() as conn:
         r1 = conn.execute(
             "DELETE FROM alerts WHERE received_at < now() - INTERVAL '7 days'"
         )
         log.info("cleanup: %d alerts dihapus", r1.rowcount)
+
+
+async def _resolve_job():
+    # Job scheduler: resolve trade open terhadap bar baru. DB sync → lempar ke thread.
+    n = await asyncio.to_thread(resolve_open_trades)
+    if n:
+        log.info("resolver: %d trade ditutup otomatis", n)
 
 
 async def forward_to_hermes(payload: dict, received_at: str) -> tuple[str, float]:
@@ -256,6 +614,8 @@ async def lifespan(app: FastAPI):
     migrate()     
     
     SCHEDULER.add_job(cleanup_old_data, "cron", hour=2, minute=0)  # 09:00 WIB
+    # Resolver tiap 1 menit: cocok untuk TF scalping 30S, bar baru cepat ketahuan.
+    SCHEDULER.add_job(_resolve_job, "interval", minutes=1)
     SCHEDULER.start()
 
     yield
@@ -313,8 +673,9 @@ async def webhook(token: str, request: Request, bg: BackgroundTasks):
     # Jangan kirim field secret ke LLM
     payload.pop("secret", None)
 
-    # Balas cepat (TradingView timeout ~3 detik);
-    bg.add_task(save_alert, payload, signal.bar_time)  # ← simpan ke DB
+    # Balas cepat (TradingView timeout ~3 detik); satu task simpan alert lalu
+    # (kalau FORWARD_AUTOCAPTURE aktif) jalankan Hermes-driven forward capture.
+    bg.add_task(ingest_signal, payload, signal.bar_time)
     return {"status": "accepted", "event_id": signal.event_id}
 
 
@@ -412,6 +773,157 @@ async def tg_do_analysis(chat_id: int, symbol: str, tf: str) -> None:
         await tg_send(chat_id, text, parse_mode="HTML", reply_markup=analyze_button(symbol, tf))
 
 
+async def tg_cmd_journal(chat_id: int, args: list[str]) -> None:
+    # /journal [live|forward] <long|short> <entry> <sl> <tp> [tag1,tag2,...]
+    usage = ("Format: /journal [live|forward] <long|short> <entry> <sl> <tp> [tag1,tag2]\n"
+             "Contoh: /journal live long 2650.5 2648 2655 bbma,reentry")
+    parts = list(args)
+
+    # Mode opsional di depan; default 'live'.
+    mode = "live"
+    if parts and parts[0].lower() in ("live", "forward"):
+        mode = parts.pop(0).lower()
+
+    if len(parts) < 4:
+        await tg_send(chat_id, usage)
+        return
+
+    direction = parts[0].lower()
+    if direction not in ("long", "short"):
+        await tg_send(chat_id, usage)
+        return
+
+    try:
+        entry = float(parts[1])
+        stop_loss = float(parts[2])
+        take_profit = float(parts[3])
+    except ValueError:
+        await tg_send(chat_id, usage)
+        return
+
+    # Tag opsional: "tag1,tag2" → list.
+    setup_tags: list[str] = []
+    if len(parts) >= 5:
+        setup_tags = [t.strip() for t in parts[4].split(",") if t.strip()]
+
+    # Sanity: long harus sl<entry<tp, short harus tp<entry<sl. Warning saja, bukan blok keras.
+    warn = ""
+    if direction == "long" and not (stop_loss < entry < take_profit):
+        warn = "\n⚠️ Catatan: untuk long normalnya sl < entry < tp."
+    elif direction == "short" and not (take_profit < entry < stop_loss):
+        warn = "\n⚠️ Catatan: untuk short normalnya tp < entry < sl."
+
+    # Tautkan alert terbaru sebagai konteks; analysis_id dibiarkan NULL dulu.
+    alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
+    alert_id = alert["id"] if alert else None
+
+    try:
+        journal_id = await asyncio.to_thread(
+            create_journal_entry, DEFAULT_SYMBOL, DEFAULT_TF, mode, direction,
+            entry, stop_loss, take_profit, setup_tags, alert_id, None,
+        )
+    except ForwardTradeExists:
+        # Hanya kena saat mode='forward': partial unique index tolak forward open kedua.
+        await tg_send(
+            chat_id,
+            f"⚠️ Sudah ada forward trade terbuka untuk {html.escape(DEFAULT_SYMBOL)} "
+            f"{html.escape(DEFAULT_TF)}. Tutup dulu sebelum membuka yang baru.",
+        )
+        return
+
+    e = html.escape
+    tags_txt = ", ".join(setup_tags) if setup_tags else "-"
+    summary = (f"✅ Jurnal #<b>{journal_id}</b> dibuat\n"
+               f"{e(mode)} {e(direction)} {e(DEFAULT_SYMBOL)} {e(DEFAULT_TF)}\n"
+               f"entry {entry} | sl {stop_loss} | tp {take_profit}\n"
+               f"tags: {e(tags_txt)}")
+    await tg_send(chat_id, summary + e(warn), parse_mode="HTML")
+
+
+async def tg_cmd_close(chat_id: int, args: list[str]) -> None:
+    # /close <id> <exit_price> [lesson text...]
+    usage = ("Format: /close <id> <exit_price> [catatan pelajaran...]\n"
+             "Contoh: /close 12 2653.2 entry telat, kejar harga")
+    if len(args) < 2:
+        await tg_send(chat_id, usage)
+        return
+
+    try:
+        journal_id = int(args[0])
+        exit_price = float(args[1])
+    except ValueError:
+        await tg_send(chat_id, usage)
+        return
+
+    lesson = " ".join(args[2:]).strip() or None
+
+    trade = await asyncio.to_thread(fetch_journal, journal_id)
+    if trade is None:
+        await tg_send(chat_id, f"❌ Jurnal #{journal_id} tidak ditemukan.")
+        return
+    if trade["status"] != "open":
+        await tg_send(chat_id, f"❌ Jurnal #{journal_id} sudah ditutup (status: {trade['status']}).")
+        return
+
+    # Kolom NUMERIC balik sebagai Decimal; paksa float supaya aman dipadu exit_price float.
+    entry = float(trade["entry"])
+    stop_loss = float(trade["stop_loss"])
+    direction = trade["direction"]
+    if direction == "long":
+        risk = entry - stop_loss
+        reward = exit_price - entry
+    else:
+        risk = stop_loss - entry
+        reward = entry - exit_price
+    if risk == 0:
+        await tg_send(chat_id, f"❌ Jurnal #{journal_id}: risk nol (entry == sl), R tak terhitung.")
+        return
+
+    r_multiple = reward / risk
+    status = classify_r(r_multiple)
+
+    ok = await asyncio.to_thread(
+        close_journal_entry, journal_id, exit_price, r_multiple, status, lesson
+    )
+    if not ok:
+        await tg_send(chat_id, f"❌ Jurnal #{journal_id} gagal ditutup (mungkin sudah tertutup).")
+        return
+
+    e = html.escape
+    txt = (f"✅ Jurnal #<b>{journal_id}</b> ditutup: <b>{e(status)}</b>\n"
+           f"exit {exit_price} | R {r_multiple:+.2f}")
+    if lesson:
+        txt += f"\nPelajaran: {e(lesson)}"
+    await tg_send(chat_id, txt, parse_mode="HTML")
+
+
+async def tg_cmd_trades(chat_id: int) -> None:
+    # Daftar trade open + satu baris stats ringkas untuk DEFAULT_SYMBOL.
+    trades = await asyncio.to_thread(fetch_open_trades, 20)
+    stats = await asyncio.to_thread(journal_stats, DEFAULT_SYMBOL, "live")
+
+    e = html.escape
+    now = datetime.now(timezone.utc)
+    if not trades:
+        lines = ["Tidak ada trade open."]
+    else:
+        lines = [f"<b>Trade open ({len(trades)})</b>"]
+        for t in trades:
+            age_min = (now - t["opened_at"]).total_seconds() / 60
+            lines.append(
+                f"#<b>{t['id']}</b> {e(t['mode'])} {e(t['direction'])} "
+                f"entry {t['entry']} sl {t['stop_loss']} tp {t['take_profit']} "
+                f"({age_min:.0f} mnt)"
+            )
+
+    avg_r = stats["avg_r"]
+    avg_r_txt = f"{avg_r:+.2f}" if avg_r is not None else "-"
+    stat_line = (f"\n<b>Stats {e(DEFAULT_SYMBOL)} (live)</b>: "
+                 f"W {stats['wins']} / L {stats['losses']} / BE {stats['breakevens']} "
+                 f"· winrate {stats['win_rate']}% · avgR {avg_r_txt}")
+    await tg_send(chat_id, "\n".join(lines) + "\n" + stat_line, parse_mode="HTML")
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, bg: BackgroundTasks):
     secret = request.headers.get("x-telegram-bot-api-secret-token", "")
@@ -456,5 +968,11 @@ async def telegram_webhook(request: Request, bg: BackgroundTasks):
                           reply_markup=analyze_button())
         else:
             await tg_send(chat_id, "Belum ada alert tersimpan.")
+    elif cmd == "/journal":
+        await tg_cmd_journal(chat_id, args)
+    elif cmd == "/close":
+        await tg_cmd_close(chat_id, args)
+    elif cmd == "/trades":
+        await tg_cmd_trades(chat_id)
 
     return {"ok": True}
