@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
+from psycopg import errors as pg_errors
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+import resolver
 
 # --- Config (semua dari Railway env vars) ---
 ANALYZE_SECRET = os.environ["ANALYZE_SECRET"]
@@ -143,6 +146,16 @@ class Signal(_Base):
     mtf: dict[str, Any] = {}
 
 class StaleAlert(Exception):
+    pass
+
+
+class ForwardTradeExists(Exception):
+    """Partial unique index menolak forward trade KEDUA yang open untuk symbol+tf.
+
+    Dipakai sebagai guard anti-pyramiding tingkat DB (lihat journal_one_open_forward di
+    schema.sql): dilempar create_journal_entry saat INSERT forward kena unique violation,
+    lalu ditangani rapi oleh pemanggil (auto-capture & command manual) — bukan error 500.
+    """
     pass
 
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
@@ -279,16 +292,25 @@ def create_journal_entry(symbol: str, timeframe: str, mode: str, direction: str,
                          entry: float, stop_loss: float, take_profit: float,
                          setup_tags: list[str], alert_id: int | None,
                          analysis_id: int | None) -> int:
-    with POOL.connection() as conn:
-        row = conn.execute(
-            """INSERT INTO journal
-               (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
-                setup_tags, alert_id, analysis_id)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-               RETURNING id""",
-            (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
-             setup_tags, alert_id, analysis_id),
-        ).fetchone()
+    # Partial unique index journal_one_open_forward adalah penjamin anti-pyramiding yang
+    # sebenarnya (pre-check has_open_forward_trade cuma fast-path). Kalau dua webhook
+    # bersamaan lolos pre-check lalu sama-sama insert forward, INSERT kedua kena
+    # UniqueViolation → ubah jadi exception domain yang ditangani rapi oleh pemanggil.
+    try:
+        with POOL.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO journal
+                   (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
+                    setup_tags, alert_id, analysis_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (symbol, timeframe, mode, direction, entry, stop_loss, take_profit,
+                 setup_tags, alert_id, analysis_id),
+            ).fetchone()
+    except pg_errors.UniqueViolation as exc:
+        raise ForwardTradeExists(
+            f"Sudah ada forward trade terbuka untuk {symbol}/{timeframe}"
+        ) from exc
     return row[0]
 
 
@@ -333,25 +355,24 @@ def close_journal_entry(journal_id: int, exit_price: float, r_multiple: float,
 
 def resolve_open_trades() -> int:
     # Auto-resolve murni dari bar alerts yang sudah tersimpan — tanpa panggilan eksternal.
+    # Keputusan SL/TP didelegasikan ke modul resolver (sumber kebenaran tunggal, dipakai
+    # juga oleh backtest.py) supaya logika live & backtest mustahil menyimpang.
+    # HANYA mode live/forward: baris mode='backtest' diresolusi khusus oleh backtest.py
+    # (opened_at-nya waktu historis, menelusuri bar live di sini bisa salah menutupnya).
     resolved = 0
     with POOL.connection() as conn:
         open_trades = conn.execute(
             """SELECT id, symbol, timeframe, direction, entry, stop_loss, take_profit, opened_at
-               FROM journal WHERE status = 'open'"""
+               FROM journal
+               WHERE status = 'open' AND mode IN ('live', 'forward')"""
         ).fetchall()
 
         for trade in open_trades:
             (journal_id, symbol, timeframe, direction, entry,
              stop_loss, take_profit, opened_at) = trade
 
-            # Risk dihitung dulu supaya bisa guard pembagian nol sebelum menelusuri bar.
-            risk = (entry - stop_loss) if direction == "long" else (stop_loss - entry)
-            if risk == 0:
-                log.warning("journal %s: risk nol (entry == sl), lewati auto-resolve", journal_id)
-                continue
-
             # Ambil high/low tiap bar setelah entry, urut waktu naik.
-            bars = conn.execute(
+            bar_rows = conn.execute(
                 """SELECT bar_time,
                           (payload->'candle'->>'high')::numeric AS high,
                           (payload->'candle'->>'low')::numeric  AS low
@@ -361,38 +382,25 @@ def resolve_open_trades() -> int:
                 (symbol, timeframe, opened_at),
             ).fetchall()
 
-            for (bar_time, bar_high, bar_low) in bars:
-                if bar_high is None or bar_low is None:
-                    continue
+            bars = [resolver.PriceBar(bar_time=row[0], high=row[1], low=row[2])
+                    for row in bar_rows]
+            outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
 
-                if direction == "long":
-                    hit_tp = bar_high >= take_profit
-                    hit_sl = bar_low <= stop_loss
-                else:  # short
-                    hit_tp = bar_low <= take_profit
-                    hit_sl = bar_high >= stop_loss
+            if outcome.is_open:
+                # Risk nol (entry == sl) di-guard resolver jadi open — catat biar kelihatan.
+                if entry == stop_loss:
+                    log.warning("journal %s: risk nol (entry == sl), lewati auto-resolve",
+                                journal_id)
+                continue
 
-                if not hit_tp and not hit_sl:
-                    continue
-
-                # Worst-case intrabar: kalau satu bar menyentuh SL dan TP sekaligus,
-                # anggap LOSS (asumsi jujur/konservatif, bukan optimis TP duluan).
-                if hit_sl:
-                    status, exit_price = "loss", stop_loss
-                else:
-                    status, exit_price = "win", take_profit
-
-                reward = (exit_price - entry) if direction == "long" else (entry - exit_price)
-                r_multiple = reward / risk
-
-                conn.execute(
-                    """UPDATE journal
-                       SET status = %s, exit_price = %s, r_multiple = %s, closed_at = %s
-                       WHERE id = %s AND status = 'open'""",
-                    (status, exit_price, r_multiple, bar_time, journal_id),
-                )
-                resolved += 1
-                break  # bar pertama yang menyentuh level menentukan hasil
+            conn.execute(
+                """UPDATE journal
+                   SET status = %s, exit_price = %s, r_multiple = %s, closed_at = %s
+                   WHERE id = %s AND status = 'open'""",
+                (outcome.status, outcome.exit_price, outcome.r_multiple,
+                 outcome.closed_at, journal_id),
+            )
+            resolved += 1
     return resolved
 
 
@@ -540,6 +548,9 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
         log.info("autocapture: jurnal forward #%s dibuat %s e=%s sl=%s tp=%s conf=%.2f",
                  journal_id, decision["decision"], entry, stop_loss, take_profit,
                  decision["confidence"])
+    except ForwardTradeExists:
+        # Race: webhook lain sudah buka forward trade duluan (unique index menolak).
+        log.info("autocapture skip: sudah ada forward trade terbuka, lewati")
     except Exception:  # noqa: BLE001
         log.exception("autocapture gagal (diabaikan, webhook tetap aman)")
 
@@ -806,10 +817,19 @@ async def tg_cmd_journal(chat_id: int, args: list[str]) -> None:
     alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
     alert_id = alert["id"] if alert else None
 
-    journal_id = await asyncio.to_thread(
-        create_journal_entry, DEFAULT_SYMBOL, DEFAULT_TF, mode, direction,
-        entry, stop_loss, take_profit, setup_tags, alert_id, None,
-    )
+    try:
+        journal_id = await asyncio.to_thread(
+            create_journal_entry, DEFAULT_SYMBOL, DEFAULT_TF, mode, direction,
+            entry, stop_loss, take_profit, setup_tags, alert_id, None,
+        )
+    except ForwardTradeExists:
+        # Hanya kena saat mode='forward': partial unique index tolak forward open kedua.
+        await tg_send(
+            chat_id,
+            f"⚠️ Sudah ada forward trade terbuka untuk {html.escape(DEFAULT_SYMBOL)} "
+            f"{html.escape(DEFAULT_TF)}. Tutup dulu sebelum membuka yang baru.",
+        )
+        return
 
     e = html.escape
     tags_txt = ", ".join(setup_tags) if setup_tags else "-"

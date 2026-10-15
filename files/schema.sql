@@ -46,3 +46,11 @@ CREATE TABLE IF NOT EXISTS journal (
 );
 CREATE INDEX IF NOT EXISTS journal_mode_symbol_status ON journal (mode, symbol, status);
 CREATE INDEX IF NOT EXISTS journal_open ON journal (status) WHERE status = 'open';
+-- Anti-pyramiding tingkat DB: maksimal satu forward trade OPEN per symbol+timeframe.
+-- Ini penjamin sebenarnya terhadap race check-then-act di forward_autocapture
+-- (dua webhook bersamaan bisa lolos pre-check sebelum call Hermes yang lambat).
+-- Catatan migrasi: kalau tabel journal sudah berisi >=2 baris forward open untuk
+-- symbol/tf yang sama, pembuatan index ini akan gagal. Tabel ini baru di PR ini
+-- (belum ada di DB manapun yang berjalan), jadi aman.
+CREATE UNIQUE INDEX IF NOT EXISTS journal_one_open_forward
+    ON journal (symbol, timeframe) WHERE mode = 'forward' AND status = 'open';

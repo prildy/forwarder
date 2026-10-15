@@ -8,8 +8,9 @@ yang bisa di-tune, lalu meresolusi tiap trade PERSIS seperti resolver live
 
 Karena main.py membaca env wajib (ANALYZE_SECRET, WEBHOOK_SECRET, TELEGRAM_*, dst) saat
 import dan langsung membangun app FastAPI, script ini TIDAK meng-import main.py. Dia
-konek sendiri ke DATABASE_URL pakai psycopg3 (lib yang sama dengan app) dan membawa
-salinan logika resolusi sendiri.
+konek sendiri ke DATABASE_URL pakai psycopg3 (lib yang sama dengan app). Logika resolusi
+SL/TP TIDAK digandakan lagi: keduanya (live & backtest) delegasi ke modul `resolver`
+yang bebas env/DB, jadi angka backtest dan live mustahil menyimpang.
 
 Catatan: alert dibersihkan setelah 7 hari oleh cleanup job, jadi backtest hanya melihat
 history ~7 hari terakhir. Itu batasan yang diketahui dan diterima.
@@ -29,6 +30,9 @@ from decimal import Decimal
 from typing import Optional
 
 import psycopg
+
+import resolver
+from resolver import Resolution
 
 # Mode jurnal yang HARAM disentuh script ini — hanya 'backtest' yang boleh ditulis/dihapus.
 PROTECTED_MODES = ("live", "forward")
@@ -52,20 +56,6 @@ class Bar:
   structure_trend: Optional[str]
   swing_high: Optional[Decimal]
   swing_low: Optional[Decimal]
-
-
-@dataclass(frozen=True)
-class Resolution:
-  """Hasil resolusi satu trade. closed_at None → masih open (tak ada bar yang menyentuh)."""
-
-  status: str                       # 'win' | 'loss' | 'open'
-  exit_price: Optional[Decimal]
-  r_multiple: Optional[Decimal]
-  closed_at: Optional[datetime]
-
-  @property
-  def is_open(self) -> bool:
-    return self.closed_at is None
 
 
 @dataclass(frozen=True)
@@ -170,54 +160,21 @@ def close_backtest_trade(conn: psycopg.Connection, journal_id: int,
   )
 
 
-# ===================== Service layer: resolusi (salinan setia resolver live) =====================
+# ===================== Service layer: resolusi (delegasi ke modul resolver) =====================
 
 
 def resolve_trade(direction: str, entry: Decimal, stop_loss: Decimal,
                   take_profit: Decimal, opened_at: datetime, bars: list[Bar]) -> Resolution:
-  """Salinan character-for-character dari main.py:resolve_open_trades (SUMBER KEBENARAN).
+  """Wrapper tipis ke resolver.resolve (SUMBER KEBENARAN tunggal, dipakai juga live).
 
-  Perbedaan hanya bentuk sumber data: resolver live query ulang `alerts` lewat SQL
-  (bar_time > opened_at), di sini kita filter list bar in-memory dengan syarat sama.
-  Semantik (urutan cek, tie-break, rumus R) identik dan memakai Decimal murni.
+  Perbedaan dengan resolver live cuma bentuk sumber data: live query ulang `alerts` lewat
+  SQL (bar_time > opened_at), di sini kita filter list bar in-memory dengan syarat sama,
+  lalu delegasikan keputusan SL/TP ke resolver. `Bar` backtest sudah punya atribut
+  bar_time/high/low yang dibutuhkan resolver, jadi diteruskan apa adanya.
   """
-  # Risk dihitung dulu supaya bisa guard pembagian nol sebelum menelusuri bar.
-  risk = (entry - stop_loss) if direction == "long" else (stop_loss - entry)
-  if risk == 0:
-    return Resolution(status="open", exit_price=None, r_multiple=None, closed_at=None)
-
-  for bar in bars:
-    # Setara WHERE bar_time > opened_at ORDER BY bar_time ASC pada resolver live.
-    if bar.bar_time <= opened_at:
-      continue
-    if bar.high is None or bar.low is None:
-      continue
-
-    if direction == "long":
-      hit_tp = bar.high >= take_profit
-      hit_sl = bar.low <= stop_loss
-    else:  # short
-      hit_tp = bar.low <= take_profit
-      hit_sl = bar.high >= stop_loss
-
-    if not hit_tp and not hit_sl:
-      continue
-
-    # Worst-case intrabar: kalau satu bar menyentuh SL dan TP sekaligus,
-    # anggap LOSS (asumsi jujur/konservatif, bukan optimis TP duluan).
-    if hit_sl:
-      status, exit_price = "loss", stop_loss
-    else:
-      status, exit_price = "win", take_profit
-
-    reward = (exit_price - entry) if direction == "long" else (entry - exit_price)
-    r_multiple = reward / risk
-    # Bar pertama yang menyentuh level menentukan hasil.
-    return Resolution(status=status, exit_price=exit_price,
-                      r_multiple=r_multiple, closed_at=bar.bar_time)
-
-  # Tak ada bar yang menyentuh di history yang tersedia → tetap open.
-  return Resolution(status="open", exit_price=None, r_multiple=None, closed_at=None)
+  # Setara WHERE bar_time > opened_at ORDER BY bar_time ASC pada resolver live.
+  candidate_bars = [bar for bar in bars if bar.bar_time > opened_at]
+  return resolver.resolve(direction, entry, stop_loss, take_profit, candidate_bars)
 
 
 # ===================== Service layer: entry rule (jantung yang bisa di-tune) =====================

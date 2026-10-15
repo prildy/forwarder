@@ -6,8 +6,12 @@ dijalankan lewat asyncio.run(...) supaya tak butuh pytest-asyncio.
 """
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, Mock
+
+import pytest
+from psycopg import errors as pg_errors
 
 import main
 
@@ -366,3 +370,133 @@ def test_forward_autocapture_hermes_exception_is_swallowed(monkeypatch):
   _run_autocapture()
 
   create.assert_not_called()
+
+
+def test_forward_autocapture_unique_violation_is_graceful(monkeypatch):
+  # Finding 2: race lolos pre-check, INSERT forward kedua kena unique index →
+  # create_journal_entry lempar ForwardTradeExists → ditangani rapi, tak propagate.
+  content = json.dumps({
+      "decision": "long", "entry": 100, "stop_loss": 99, "take_profit": 102,
+      "confidence": 0.9,
+  })
+  _, create = _setup_autocapture(monkeypatch, enabled=True, hermes_content=content)
+  create.side_effect = main.ForwardTradeExists("sudah ada forward terbuka")
+  # Tak ada exception yang keluar dari background task.
+  _run_autocapture()
+
+  create.assert_called_once()
+
+
+# ===================== fake POOL untuk tes query path (tanpa DB nyata) =====================
+
+
+class _FakeCursor:
+  def __init__(self, rows):
+    self._rows = rows
+    self.rowcount = len(rows)
+
+  def fetchall(self):
+    return self._rows
+
+  def fetchone(self):
+    return self._rows[0] if self._rows else None
+
+
+class _FakeConn:
+  """Konektor palsu: rekam tiap execute dan balas hasil sesuai urutan panggilan."""
+
+  def __init__(self, results_by_call):
+    self.executed = []            # list of (sql, params)
+    self._results = results_by_call
+
+  def execute(self, sql, params=None):
+    index = len(self.executed)
+    self.executed.append((sql, params))
+    rows = self._results[index] if index < len(self._results) else []
+    return _FakeCursor(rows)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *exc):
+    return False
+
+
+class _FakePool:
+  def __init__(self, conn):
+    self._conn = conn
+
+  def connection(self):
+    return self._conn
+
+
+# ===================== create_journal_entry: unique violation (Finding 2) =====================
+
+
+def test_create_journal_entry_raises_forward_trade_exists_on_unique_violation(monkeypatch):
+  class _RaisingConn(_FakeConn):
+    def execute(self, sql, params=None):
+      raise pg_errors.UniqueViolation("duplicate key journal_one_open_forward")
+
+  monkeypatch.setattr(main, "POOL", _FakePool(_RaisingConn([])))
+
+  with pytest.raises(main.ForwardTradeExists):
+    main.create_journal_entry("FX:XAUUSD", "30S", "forward", "long",
+                              100.0, 99.0, 102.0, [], None, None)
+
+
+def test_create_journal_entry_returns_id_on_success(monkeypatch):
+  conn = _FakeConn([[(42,)]])   # INSERT ... RETURNING id
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  journal_id = main.create_journal_entry("FX:XAUUSD", "30S", "live", "long",
+                                         100.0, 99.0, 102.0, [], None, None)
+
+  assert journal_id == 42
+
+
+# ===================== resolve_open_trades: scoping & delegasi (Finding 1 + 3) =====================
+
+
+def test_resolve_open_trades_query_scoped_to_live_and_forward(monkeypatch):
+  # Finding 1: SELECT open trades harus memfilter mode live/forward supaya baris
+  # mode='backtest' tak pernah ikut terseleksi/ditutup resolver live.
+  conn = _FakeConn([[]])         # query open-trades balas kosong (seperti DB tanpa live/forward)
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  resolved = main.resolve_open_trades()
+
+  assert resolved == 0
+  open_sql = conn.executed[0][0]
+  assert "mode IN ('live', 'forward')" in open_sql
+  assert "status = 'open'" in open_sql
+  # Tak ada query/UPDATE lanjutan karena tak ada open trade.
+  assert len(conn.executed) == 1
+
+
+def test_resolve_open_trades_closes_live_trade_via_resolver(monkeypatch):
+  # Finding 3: resolver bersama dipakai — trade live long yang TP-nya tersentuh ditutup win.
+  opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  bar_time = opened_at + timedelta(minutes=1)
+  open_row = (7, "FX:XAUUSD", "30S", "long",
+              Decimal("100"), Decimal("99"), Decimal("102"), opened_at)
+  bar_row = (bar_time, Decimal("102"), Decimal("100"))   # high>=tp → win
+
+  conn = _FakeConn([
+      [open_row],     # SELECT open trades
+      [bar_row],      # SELECT bars
+      [],             # UPDATE
+  ])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  resolved = main.resolve_open_trades()
+
+  assert resolved == 1
+  update_sql, update_params = conn.executed[2]
+  assert "UPDATE journal" in update_sql
+  # (status, exit_price, r_multiple, closed_at, id)
+  assert update_params[0] == "win"
+  assert update_params[1] == Decimal("102")
+  assert update_params[2] == Decimal(2)
+  assert update_params[3] == bar_time
+  assert update_params[4] == 7
