@@ -94,12 +94,15 @@ This repo is wired for autonomous improvement cycles. The `orchestrator` agent
 truth the agents read; the rules here override an agent's own defaults.
 
 ### Commands
-All commands run from `files/` (the deployed app lives there).
+Run every command **from the repo root**, exactly as written (no `cd`, no `&&` chains),
+so it matches the pre-approved permissions in `.claude/settings.json`.
 
-- Install: `pip install -r files/requirements.txt -r files/requirements-dev.txt`
-- Test: `cd files && pytest -q`  *(the gate — 83+ tests, DB/network-free)*
-- Syntax/lint gate: `cd files && python -m compileall -q main.py backtest.py resolver.py conftest.py tests`
-- Run locally (optional): `cd files && uvicorn main:app --reload` (needs the env vars in `files/CLAUDE.md`)
+- Install: **already done for you.** The runner pre-installs `files/requirements.txt` and
+  `files/requirements-dev.txt` into an active virtualenv before each cycle. Never run
+  `pip install` or create a venv; if a dependency is missing, report it instead.
+- Test: `pytest -q`  *(the gate — 83+ tests, DB/network-free; root `pytest.ini` points at `files/tests`)*
+- Syntax/lint gate: `python -m compileall -q files/main.py files/backtest.py files/resolver.py files/conftest.py files/tests`
+- Run locally (optional, humans only): `cd files && uvicorn main:app --reload` (needs the env vars in `files/CLAUDE.md`)
 
 A change is only **done** when `pytest` passes and the `compileall` gate is clean.
 There is no separate linter/formatter configured yet — do not introduce one as a
@@ -126,7 +129,7 @@ drive-by; if a backlog item asks for it, that's its own PR.
   (Railway installs it for production).
 
 ### Off-limits (agents must never edit)
-- `.github/workflows/`, `.claude/`, this `CLAUDE.md`, `files/CLAUDE.md`, `.env*`
+- `.github/workflows/`, `.claude/`, this `CLAUDE.md`, `files/CLAUDE.md`, `pytest.ini`, `.env*`
 - `files/schema.sql` structure, and the `pine_script/` source (TV-managed; see its notes)
 - Deploy config: `railway.json`, Railway variables/volumes
 - Never push to `main`, never force-push, never merge PRs.
