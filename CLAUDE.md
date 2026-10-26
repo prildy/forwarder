@@ -83,3 +83,50 @@ Keep folder name and the frontmatter `name:` identical when adding/renaming skil
 Each service's config is its own `railway.json`; set the service **root directory**
 to `files/` or `hermes-config/` in Railway so the right config/build is used. Use
 the `use-railway` skill for deploys, variables, volumes, and troubleshooting.
+
+---
+
+## Autonomous agents (multi-agent setup)
+
+This repo is wired for autonomous improvement cycles. The `orchestrator` agent
+(`.claude/agents/`) picks one task, delegates to `planner` → `implementer` / `tester`
+→ `reviewer`, and opens a PR on an `agent/*` branch. This section is the source of
+truth the agents read; the rules here override an agent's own defaults.
+
+### Commands
+All commands run from `files/` (the deployed app lives there).
+
+- Install: `pip install -r files/requirements.txt -r files/requirements-dev.txt`
+- Test: `cd files && pytest -q`  *(the gate — 83+ tests, DB/network-free)*
+- Syntax/lint gate: `cd files && python -m compileall -q main.py backtest.py resolver.py conftest.py tests`
+- Run locally (optional): `cd files && uvicorn main:app --reload` (needs the env vars in `files/CLAUDE.md`)
+
+A change is only **done** when `pytest` passes and the `compileall` gate is clean.
+There is no separate linter/formatter configured yet — do not introduce one as a
+drive-by; if a backlog item asks for it, that's its own PR.
+
+### What "improvement" means here (priority order)
+1. Fix failing or flaky tests
+2. Fix bugs and unhandled edge cases (payload validation, dedupe, DB/async handling)
+3. Add tests for untested important code in `files/` (`main.py`, `resolver.py`, `backtest.py`)
+4. Remove dead code and obvious readability problems
+5. Project goal: keep the TradingView → Hermes pipeline correct and robust —
+   schema 2.0/2.1 validation, dedupe integrity, and never forwarding the `secret`
+   field to Hermes
+
+### Conventions for agents
+- Single-file app: keep forwarder logic in `files/main.py`. Comments are in
+  **Indonesian** — match that style (see `files/CLAUDE.md`).
+- Sync DB calls go through `asyncio.to_thread`; keep new DB work off the event loop.
+- Tests must stay deterministic: no real network, no real DB, no `sleep`, no
+  wall-clock dependence (`files/conftest.py` sets the required env + dummy DATABASE_URL).
+- Commit messages: conventional commits (`feat:`, `fix:`, `test:`, `refactor:`,
+  `perf:`, `docs:`, `chore:`). Branch names: `agent/<cycle-id>-<slug>`.
+- No new entries in `files/requirements.txt` without justification in the PR
+  (Railway installs it for production).
+
+### Off-limits (agents must never edit)
+- `.github/workflows/`, `.claude/`, this `CLAUDE.md`, `files/CLAUDE.md`, `.env*`
+- `files/schema.sql` structure, and the `pine_script/` source (TV-managed; see its notes)
+- Deploy config: `railway.json`, Railway variables/volumes
+- Never push to `main`, never force-push, never merge PRs.

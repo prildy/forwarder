@@ -1,0 +1,31 @@
+# CI that gates every agent PR. Make it a required status check in branch protection.
+# Mirrors the commands in CLAUDE.md. The forwarder app lives in files/.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: files
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Syntax check (lint gate)
+        run: python -m compileall -q main.py backtest.py resolver.py conftest.py tests
+
+      - name: Tests
+        run: pytest -q

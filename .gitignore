@@ -5,6 +5,11 @@
 .devx/
 .mcp.json
 
+# Multi-agent setup must live in the repo, but ~/.gitignore_global ignores **/.claude/.
+# Re-include the shared config (agents + permissions); keep local-only overrides out.
+!.claude/
+.claude/settings.local.json
+
 # Python bytecode
 __pycache__/
 *.py[cod]
