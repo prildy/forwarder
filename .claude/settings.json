@@ -27,9 +27,10 @@
       "Bash(gh pr create *)",
       "Bash(gh issue list*)",
       "Bash(gh issue create *)",
-      "Bash(pip install*)",
       "Bash(python3 *)",
       "Bash(python -m *)",
+      "Bash(python *)",
+      "Bash(pytest -q*)",
       "Bash(pytest*)",
       "Bash(ls*)",
       "Bash(cat *)",
@@ -58,7 +59,14 @@
       "Edit(./.claude/**)",
       "Write(./.claude/**)",
       "Edit(./CLAUDE.md)",
-      "Write(./CLAUDE.md)"
+      "Write(./CLAUDE.md)",
+      "Bash(pip *)",
+      "Bash(python -m pip*)",
+      "Bash(python3 -m pip*)",
+      "Bash(python3 -m venv*)",
+      "Bash(python -m venv*)",
+      "Edit(./pytest.ini)",
+      "Write(./pytest.ini)"
     ]
   }
 }
