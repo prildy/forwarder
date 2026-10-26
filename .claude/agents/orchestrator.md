@@ -27,15 +27,18 @@ Read `CLAUDE.md` first. It defines the test/lint commands, conventions, what "im
 
 7. **Review.** Delegate to `reviewer` with the task description. If it returns required fixes, send them to `implementer`, re-verify, and re-review. Max 2 review rounds.
 
-8. **Ship or stop.**
+8. **Ship or stop.** You do NOT push or open PRs yourself — the runner does that after you finish.
    - Tests + lint green AND reviewer says `APPROVE`:
-     - If the task came from `BACKLOG.md`, tick it (`- [x]`) in the same branch.
-     - `git add -A && git commit -m "<type>: <summary>"` (conventional commit style)
-     - `git push -u origin <branch>`
-     - `gh pr create --base <base-branch> --label agent --title "<type>: <summary>" --body "<body>"` using the PR body template below.
-   - Otherwise do NOT push. Run `gh issue create --label agent-blocked --title "Agent blocked: <task>" --body "<what you tried, the failing output, your best guess at the cause>"`.
+     - If the task came from `BACKLOG.md`, tick it (`- [ ]` → `- [x]`) with the Edit tool, in the same branch.
+     - `git add -A`
+     - `git commit -m "<type>: <summary>"` (conventional commit style; one `-m` per paragraph is fine)
+     - With the Write tool, create `.agent-out/pr-title.txt` (one line: `<type>: <summary>`) and
+       `.agent-out/pr-body.md` (the PR body template below). `.agent-out/` is git-ignored.
+     - The runner then pushes your `agent/*` branch and opens the PR with the `agent` label.
+   - Otherwise: do not commit. Write `.agent-out/issue.md` (what you tried, the failing output, your best guess at the cause), then run
+     `gh issue create --label agent-blocked --title "Agent blocked: <task>" --body-file .agent-out/issue.md`.
 
-9. **Finish.** Your final message is a 3–6 line summary: task, outcome (PR URL or issue URL), and anything a human should look at. Then stop. Do not start a second task.
+9. **Finish.** Your final message is a 3–6 line summary: task, outcome (`ready for PR` + branch name, or the issue URL), and anything a human should look at. Then stop. Do not start a second task.
 
 ## PR body template
 
@@ -57,6 +60,13 @@ Read `CLAUDE.md` first. It defines the test/lint commands, conventions, what "im
 
 _Opened by the autonomous agent, cycle <cycle-id>._
 ```
+
+## Command rules (headless permissions)
+- Run exactly ONE command per Bash call: no `&&`, `;`, `|` chains, no `cd`, no subshells.
+  Chained commands don't match the pre-approved permissions and get denied.
+- Edit files with the Edit/Write tools, never with `sed`, `awk`, `echo >` or heredocs.
+- Never run `git push` or `gh pr create` — the runner owns those.
+- If a command is denied, don't look for a workaround; note it in your final summary.
 
 ## Hard rules
 - Never push to the base branch, never force-push, never merge PRs.
