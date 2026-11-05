@@ -39,3 +39,6 @@ htmlcov/
 # Runtime logs/data (forwarder LOG_DIR, if ever pointed at a local path)
 data/
 *.log
+
+# Autonomous agent hand-off files (PR title/body, blocked-issue body) — read by the runner, never committed
+.agent-out/
