@@ -94,15 +94,18 @@ This repo is wired for autonomous improvement cycles. The `orchestrator` agent
 truth the agents read; the rules here override an agent's own defaults.
 
 ### Commands
+Base branch: **`main`** (there is no `master`). PRs target `main`; diffs are `git diff main...HEAD`.
+
 Run every command **from the repo root**, exactly as written (no `cd`, no `&&` chains),
 so it matches the pre-approved permissions in `.claude/settings.json`.
 
 - Install: **already done for you.** The runner pre-installs `files/requirements.txt` and
   `files/requirements-dev.txt` into an active virtualenv before each cycle. Never run
   `pip install` or create a venv; if a dependency is missing, report it instead.
-- Test: `pytest -q`  *(the gate — 83+ tests, DB/network-free; root `pytest.ini` points at `files/tests`)*
+- Test: `pytest -q`  *(the gate — DB/network-free; root `pytest.ini` points at `files/tests`)*
 - Syntax/lint gate: `python -m compileall -q files/main.py files/backtest.py files/resolver.py files/conftest.py files/tests`
-- Run locally (optional, humans only): `cd files && uvicorn main:app --reload` (needs the env vars in `files/CLAUDE.md`)
+- Push / PR: **the runner does this**, not the agents. Never run `git push` or `gh pr create`.
+- Run locally (optional, humans only): `cd files && uvicorn main:app --reload` (needs the env vars listed in the `files/` section above)
 
 A change is only **done** when `pytest` passes and the `compileall` gate is clean.
 There is no separate linter/formatter configured yet — do not introduce one as a
@@ -119,7 +122,7 @@ drive-by; if a backlog item asks for it, that's its own PR.
 
 ### Conventions for agents
 - Single-file app: keep forwarder logic in `files/main.py`. Comments are in
-  **Indonesian** — match that style (see `files/CLAUDE.md`).
+  **Indonesian** — match that style (see the `files/` section above).
 - Sync DB calls go through `asyncio.to_thread`; keep new DB work off the event loop.
 - Tests must stay deterministic: no real network, no real DB, no `sleep`, no
   wall-clock dependence (`files/conftest.py` sets the required env + dummy DATABASE_URL).
@@ -129,7 +132,7 @@ drive-by; if a backlog item asks for it, that's its own PR.
   (Railway installs it for production).
 
 ### Off-limits (agents must never edit)
-- `.github/workflows/`, `.claude/`, this `CLAUDE.md`, `files/CLAUDE.md`, `pytest.ini`, `.env*`
+- `.github/workflows/`, `.claude/`, this `CLAUDE.md`, `pytest.ini`, `.env*`
 - `files/schema.sql` structure, and the `pine_script/` source (TV-managed; see its notes)
 - Deploy config: `railway.json`, Railway variables/volumes
 - Never push to `main`, never force-push, never merge PRs.

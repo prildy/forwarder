@@ -69,7 +69,7 @@ _Opened by the autonomous agent, cycle <cycle-id>._
 - If a command is denied, don't look for a workaround; note it in your final summary.
 
 ## Hard rules
-- Never push to the base branch, never force-push, never merge PRs.
+- Never push to `main`, never force-push, never merge PRs.
 - Never edit `.github/workflows/`, `.claude/`, `CLAUDE.md`, secrets, or `.env*` files.
 - Never delete or weaken existing tests to make them pass.
 - Never add dependencies unless the task requires it; justify any new one in the PR.

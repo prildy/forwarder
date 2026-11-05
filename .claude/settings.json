@@ -1,7 +1,4 @@
 {
-  "enabledPlugins": {
-    "railway@claude-plugins-official": true
-  },
   "permissions": {
     "allow": [
       "Read",
@@ -26,27 +23,18 @@
       "Bash(gh pr view*)",
       "Bash(gh issue list*)",
       "Bash(gh issue create *)",
-      "Bash(python3 *)",
-      "Bash(python -m *)",
-      "Bash(python *)",
-      "Bash(pytest -q*)",
+      "Bash(python -m compileall *)",
+      "Bash(python -m pytest*)",
       "Bash(pytest*)",
       "Bash(ls*)",
-      "Bash(cat *)",
       "Bash(mkdir *)",
-      "Bash(wc *)",
-      "Bash(head *)",
-      "Bash(tail *)"
+      "Bash(wc *)"
     ],
     "deny": [
       "Bash(git config*)",
       "Bash(sed *)",
       "Bash(gh pr create*)",
       "Bash(git push*)",
-      "Bash(git push origin main*)",
-      "Bash(git push origin master*)",
-      "Bash(git push --force*)",
-      "Bash(git push -f*)",
       "Bash(gh pr merge*)",
       "Bash(gh repo *)",
       "Bash(gh secret*)",
@@ -56,6 +44,10 @@
       "Bash(sudo *)",
       "Bash(rm -rf *)",
       "Read(./.env*)",
+      "Read(./**/.env*)",
+      "Bash(cat *.env*)",
+      "Bash(head *.env*)",
+      "Bash(tail *.env*)",
       "Edit(./.env*)",
       "Edit(./.github/workflows/**)",
       "Write(./.github/workflows/**)",
@@ -69,7 +61,17 @@
       "Bash(python3 -m venv*)",
       "Bash(python -m venv*)",
       "Edit(./pytest.ini)",
-      "Write(./pytest.ini)"
+      "Write(./pytest.ini)",
+      "Edit(./files/schema.sql)",
+      "Write(./files/schema.sql)",
+      "Edit(./pine_script/**)",
+      "Write(./pine_script/**)",
+      "Edit(./**/railway.json)",
+      "Write(./**/railway.json)",
+      "Edit(./files/railway.json)",
+      "Write(./files/railway.json)",
+      "Edit(./hermes-config/railway.json)",
+      "Write(./hermes-config/railway.json)"
     ]
   }
 }
