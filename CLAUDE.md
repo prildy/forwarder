@@ -102,7 +102,7 @@ so it matches the pre-approved permissions in `.claude/settings.json`.
 - Install: **already done for you.** The runner pre-installs `files/requirements.txt` and
   `files/requirements-dev.txt` into an active virtualenv before each cycle. Never run
   `pip install` or create a venv; if a dependency is missing, report it instead.
-- Test: `pytest -q`  *(the gate — 83+ tests, DB/network-free; root `pytest.ini` points at `files/tests`)*
+- Test: `pytest -q`  *(the gate — DB/network-free; root `pytest.ini` points at `files/tests`)*
 - Syntax/lint gate: `python -m compileall -q files/main.py files/backtest.py files/resolver.py files/conftest.py files/tests`
 - Push / PR: **the runner does this**, not the agents. Never run `git push` or `gh pr create`.
 - Run locally (optional, humans only): `cd files && uvicorn main:app --reload` (needs the env vars listed in the `files/` section above)

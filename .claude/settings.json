@@ -1,7 +1,4 @@
 {
-  "enabledPlugins": {
-    "railway@claude-plugins-official": true
-  },
   "permissions": {
     "allow": [
       "Read",
@@ -64,7 +61,17 @@
       "Bash(python3 -m venv*)",
       "Bash(python -m venv*)",
       "Edit(./pytest.ini)",
-      "Write(./pytest.ini)"
+      "Write(./pytest.ini)",
+      "Edit(./files/schema.sql)",
+      "Write(./files/schema.sql)",
+      "Edit(./pine_script/**)",
+      "Write(./pine_script/**)",
+      "Edit(./**/railway.json)",
+      "Write(./**/railway.json)",
+      "Edit(./files/railway.json)",
+      "Write(./files/railway.json)",
+      "Edit(./hermes-config/railway.json)",
+      "Write(./hermes-config/railway.json)"
     ]
   }
 }
