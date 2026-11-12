@@ -165,14 +165,17 @@ def migrate():
     with POOL.connection() as conn, open("schema.sql") as f:
         conn.execute(f.read())
 
-def save_alert(p: dict, bar_time: datetime):
+def save_alert(p: dict, bar_time: datetime) -> bool:
+    # Kembalikan True jika baris baru diinsert, False jika konflik (bar sudah ada).
+    # psycopg set rowcount=0 saat DO NOTHING menyerap baris, 1 saat insert berhasil.
     with POOL.connection() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """INSERT INTO alerts (symbol, timeframe, bar_time, payload)
                VALUES (%s, %s, %s, %s)
                ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING""",
             (p["symbol"], p["timeframe"], bar_time, Jsonb(p)),
         )
+        return cursor.rowcount == 1
 
 def save_analysis(alert: dict, symbol: str, timeframe: str, content: str,
                   latency_s: float, trigger_src: str) -> None:
@@ -558,8 +561,12 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
 async def ingest_signal(payload: dict, bar_time: datetime) -> None:
     # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
     # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
-    await asyncio.to_thread(save_alert, payload, bar_time)
-    await forward_autocapture(payload, bar_time)
+    # Guard duplikat bar out-of-order: kalau save_alert mengembalikan False berarti
+    # ON CONFLICT DO NOTHING menyerap baris — bar sudah ada, skip forward_autocapture
+    # agar tidak ada dua panggilan Hermes + dua percobaan forward untuk bar yang sama.
+    inserted = await asyncio.to_thread(save_alert, payload, bar_time)
+    if inserted:
+        await forward_autocapture(payload, bar_time)
 
 
 def cleanup_old_data():
