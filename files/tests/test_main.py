@@ -500,3 +500,92 @@ def test_resolve_open_trades_closes_live_trade_via_resolver(monkeypatch):
   assert update_params[2] == Decimal(2)
   assert update_params[3] == bar_time
   assert update_params[4] == 7
+
+
+# ===================== save_alert: kembalikan bool berdasarkan rowcount =====================
+
+
+def test_save_alert_returns_true_on_fresh_insert(monkeypatch):
+  # rowcount=1 → baris baru diinsert → True
+  conn = _FakeConn([[("inserted",)]])   # rowcount = len(rows) = 1
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
+  result = main.save_alert(payload, bar_time)
+
+  assert result is True
+
+
+def test_save_alert_returns_false_on_conflict(monkeypatch):
+  # rowcount=0 → ON CONFLICT DO NOTHING menyerap baris → False
+  conn = _FakeConn([[]])   # rowcount = len(rows) = 0
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
+  result = main.save_alert(payload, bar_time)
+
+  assert result is False
+
+
+# ===================== ingest_signal: guard duplikat bar out-of-order =====================
+
+
+def test_ingest_signal_calls_forward_autocapture_when_inserted(monkeypatch):
+  # save_alert kembalikan True → forward_autocapture harus dipanggil sekali.
+  monkeypatch.setattr(main, "save_alert", Mock(return_value=True))
+  mock_autocapture = AsyncMock()
+  monkeypatch.setattr(main, "forward_autocapture", mock_autocapture)
+
+  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
+  asyncio.run(main.ingest_signal(payload, bar_time))
+
+  mock_autocapture.assert_awaited_once_with(payload, bar_time)
+
+
+def test_ingest_signal_skips_forward_autocapture_on_conflict(monkeypatch):
+  # save_alert kembalikan False (bar sudah ada, out-of-order dup) →
+  # forward_autocapture harus dilewati agar tidak ada dua panggilan Hermes.
+  monkeypatch.setattr(main, "save_alert", Mock(return_value=False))
+  mock_autocapture = AsyncMock()
+  monkeypatch.setattr(main, "forward_autocapture", mock_autocapture)
+
+  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
+  asyncio.run(main.ingest_signal(payload, bar_time))
+
+  mock_autocapture.assert_not_awaited()
+
+
+# ===================== async DB audit: migrate() via asyncio.to_thread =====================
+
+
+def test_migrate_is_sync_callable():
+    # migrate() harus fungsi sinkron (bukan coroutine) supaya aman dipakai asyncio.to_thread.
+    import inspect
+    assert not inspect.iscoroutinefunction(main.migrate)
+
+
+def test_lifespan_calls_migrate_via_to_thread(monkeypatch):
+    # Verifikasi lifespan tidak memanggil migrate() langsung di event loop;
+    # ia harus lewat asyncio.to_thread supaya event loop tidak ke-block saat startup.
+    calls = []
+
+    # Patch migrate dan POOL agar tidak butuh koneksi nyata
+    monkeypatch.setattr(main, "migrate", lambda: calls.append("migrate"))
+    monkeypatch.setattr(main.POOL, "open", lambda: None)
+    monkeypatch.setattr(main.POOL, "close", lambda: None)
+    monkeypatch.setattr(main, "SCHEDULER", type("FakeSched", (), {
+        "add_job": lambda *a, **k: None,
+        "start": lambda self: None,
+        "shutdown": lambda self: None,
+    })())
+
+    async def _run():
+        async with main.lifespan(main.app):
+            pass
+
+    asyncio.run(_run())
+    assert "migrate" in calls, "migrate harus dipanggil saat startup lifespan"
