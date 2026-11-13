@@ -31,6 +31,8 @@ class PriceBarLike(Protocol):
   bar_time: datetime
   high: Optional[Decimal]
   low: Optional[Decimal]
+  # close opsional (dibaca lewat getattr; bar duck-typed bisa tak punya field ini).
+  # close: Optional[Decimal]
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class PriceBar:
   bar_time: datetime
   high: Optional[Decimal]
   low: Optional[Decimal]
+  close: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,9 @@ class Resolution:
   exit_price: Optional[Decimal]
   r_multiple: Optional[Decimal]
   closed_at: Optional[datetime]
+  gross_r: Optional[Decimal] = None     # R sebelum biaya
+  filled_at: Optional[datetime] = None  # waktu entry terisi (model fill)
+  exit_reason: Optional[str] = None     # 'tp' | 'sl' | 'no_fill' | 'timeout'
 
   @property
   def is_open(self) -> bool:
@@ -60,14 +66,27 @@ class Resolution:
 OPEN = Resolution(status="open", exit_price=None, r_multiple=None, closed_at=None)
 
 
+def classify_r(r: Decimal) -> str:
+  """Klasifikasi status dari R — ambang sama dengan main.classify_r."""
+  if abs(r) < Decimal("0.05"):
+    return "breakeven"
+  return "win" if r > 0 else "loss"
+
+
 def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
-            take_profit: Decimal, bars: Iterable[PriceBarLike]) -> Resolution:
+            take_profit: Decimal, bars: Iterable[PriceBarLike], *,
+            cost: Decimal = Decimal(0)) -> Resolution:
   """Resolusi satu trade terhadap deretan bar yang SUDAH terurut waktu naik.
 
   `bars` wajib hanya berisi bar SETELAH entry (pemfilteran bar_time > opened_at adalah
   tanggung jawab pemanggil: resolver live memfilter lewat SQL, backtest memfilter list
   in-memory sebelum delegasi ke sini).
+
+  `cost` = biaya round-trip dalam satuan harga (spread + slippage kedua sisi); dikurangkan
+  dari R sebesar cost/risk. Status tetap ditentukan level yang tersentuh.
   """
+  if cost < 0:
+    raise ValueError("cost tidak boleh negatif")
   # Risk dihitung dulu supaya bisa guard pembagian nol sebelum menelusuri bar.
   risk = (entry - stop_loss) if direction == "long" else (stop_loss - entry)
   if risk == 0:
@@ -95,10 +114,12 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
       status, exit_price = "win", take_profit
 
     reward = (exit_price - entry) if direction == "long" else (entry - exit_price)
-    r_multiple = reward / risk
+    gross_r = reward / risk
+    r_multiple = gross_r - (cost / risk)
     # Bar pertama yang menyentuh level menentukan hasil.
     return Resolution(status=status, exit_price=exit_price,
-                      r_multiple=r_multiple, closed_at=bar.bar_time)
+                      r_multiple=r_multiple, closed_at=bar.bar_time,
+                      gross_r=gross_r, exit_reason="sl" if hit_sl else "tp")
 
   # Tak ada bar yang menyentuh di history yang tersedia → tetap open.
   return OPEN

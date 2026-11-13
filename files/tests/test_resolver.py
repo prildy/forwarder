@@ -247,3 +247,72 @@ def test_resolve_touch_after_neutral_bars_has_later_closed_at():
 
   assert res.status == "win"
   assert res.closed_at == T0 + timedelta(minutes=7)
+
+
+# --- M2: biaya trading dan field hasil ---
+
+def test_cost_zero_r_equals_gross_r():
+  res = resolve("long", Decimal("100"), Decimal("99"), Decimal("102"),
+                [_bar(1, high=102, low=100)])
+  assert res.r_multiple == res.gross_r == Decimal("2")
+
+
+def test_long_tp_with_cost():
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"),
+                [_bar(1, high=104, low=100)], cost=Decimal("0.4"))
+  assert res.status == "win"
+  assert res.gross_r == Decimal("2")
+  assert res.r_multiple == Decimal("1.8")
+  assert res.exit_reason == "tp"
+
+
+def test_long_sl_with_cost():
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"),
+                [_bar(1, high=101, low=98)], cost=Decimal("0.4"))
+  assert res.status == "loss"
+  assert res.gross_r == Decimal("-1")
+  assert res.r_multiple == Decimal("-1.2")
+  assert res.exit_reason == "sl"
+
+
+def test_short_mirror_with_cost():
+  tp = resolve("short", Decimal("100"), Decimal("102"), Decimal("96"),
+               [_bar(1, high=100, low=96)], cost=Decimal("0.4"))
+  assert (tp.gross_r, tp.r_multiple, tp.exit_reason) == (Decimal("2"), Decimal("1.8"), "tp")
+  sl = resolve("short", Decimal("100"), Decimal("102"), Decimal("96"),
+               [_bar(1, high=102, low=99)], cost=Decimal("0.4"))
+  assert (sl.gross_r, sl.r_multiple, sl.exit_reason) == (Decimal("-1"), Decimal("-1.2"), "sl")
+
+
+def test_tp_touch_stays_win_even_if_cost_makes_r_negative():
+  res = resolve("long", Decimal("100"), Decimal("99"), Decimal("100.5"),
+                [_bar(1, high=101, low=100)], cost=Decimal("1"))
+  assert res.status == "win"
+  assert res.r_multiple < 0
+
+
+def test_negative_cost_raises():
+  with pytest.raises(ValueError):
+    resolve("long", Decimal("100"), Decimal("99"), Decimal("102"), [], cost=Decimal("-0.1"))
+
+
+def test_exit_reason_none_when_open():
+  assert resolver.OPEN.exit_reason is None
+  assert resolver.OPEN.gross_r is None and resolver.OPEN.filled_at is None
+
+
+def test_pricebar_close_defaults_to_none():
+  assert _bar(1, high=1, low=1).close is None
+
+
+@pytest.mark.parametrize("r,expected", [
+  (Decimal("0.049"), "breakeven"),
+  (Decimal("-0.049"), "breakeven"),
+  (Decimal("0"), "breakeven"),
+  (Decimal("0.05"), "win"),
+  (Decimal("-0.05"), "loss"),
+  (Decimal("2"), "win"),
+  (Decimal("-1"), "loss"),
+])
+def test_classify_r_boundaries(r, expected):
+  assert resolver.classify_r(r) == expected
