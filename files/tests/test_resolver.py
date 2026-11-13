@@ -457,12 +457,12 @@ def test_require_fill_never_touched_no_max_returns_open_sentinel():
   assert res is resolver.OPEN
 
 
-def test_require_fill_false_ignores_max_fill_bars():
+def test_max_fill_bars_without_require_fill_raises():
+  # Diubah dari "diabaikan diam-diam" menjadi ValueError (perbaikan review).
   bars = [_bar(i, high=105, low=104) for i in range(1, 6)]
-  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104.5"), bars,
-                max_fill_bars=2)
-  assert res.status == "win"
-  assert res.filled_at is None
+  with pytest.raises(ValueError):
+    resolve("long", Decimal("100"), Decimal("98"), Decimal("104.5"), bars,
+            max_fill_bars=2)
 
 
 def test_fill_with_cost_closed_result_carries_filled_at_and_net_r():
@@ -656,3 +656,49 @@ def test_timeout_after_fill_carries_cost_and_filled_at():
   assert res.r_multiple == Decimal("0.3")
   assert res.status == "win"
   assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+# --- perbaikan review: validasi parameter, risk terbalik, keterbatasan gap ---
+
+@pytest.mark.parametrize("kwargs", [
+  {"max_hold_bars": 0},
+  {"max_hold_bars": -1},
+  {"require_fill": True, "max_fill_bars": 0},
+  {"require_fill": True, "max_fill_bars": -2},
+])
+def test_invalid_bar_limits_raise(kwargs):
+  with pytest.raises(ValueError):
+    resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), [], **kwargs)
+
+
+def test_inverted_levels_raise_long_and_short():
+  with pytest.raises(ValueError):
+    resolve("long", Decimal("100"), Decimal("101"), Decimal("102"), [])
+  with pytest.raises(ValueError):
+    resolve("short", Decimal("100"), Decimal("99"), Decimal("98"), [])
+
+
+def test_gap_fill_is_booked_at_entry_and_stop_breach_is_loss():
+  # Perilaku terdokumentasi: fill gap dianggap di `entry`; bar fill yang menembus SL = LOSS
+  # dengan exit di level stop (R = -1, optimistis kalau harga sebenarnya melompati SL).
+  bars = [_bar(1, high=102, low=101), _bar(2, high=97.5, low=97)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"), bars,
+                require_fill=True)
+  assert res.status == "loss"
+  assert res.exit_price == Decimal("98")
+  assert res.gross_r == Decimal("-1")
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_gap_on_first_counted_bar_is_not_detected():
+  # Keterbatasan terdokumentasi: bar pertama tak punya bar sebelumnya, jadi bar yang
+  # seluruhnya di bawah entry (long limit) tidak dianggap fill.
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"),
+                [_bar(1, high=99.5, low=99)], require_fill=True)
+  assert res is resolver.OPEN
+
+
+def test_resolver_classify_r_agrees_with_main_classify_r():
+  import main
+  for value in ["-0.05", "-0.0499", "0", "0.0499", "0.05", "1", "-1"]:
+    assert resolver.classify_r(Decimal(value)) == main.classify_r(float(value)), value

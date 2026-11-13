@@ -11,6 +11,13 @@ Semantik yang dijaga identik dengan perilaku lama kedua resolver:
 - tie-break worst-case intrabar: satu bar menyentuh SL dan TP sekaligus → LOSS di stop_loss,
 - bar PERTAMA yang menyentuh level menentukan hasil,
 - guard risk nol (entry == stop_loss) → tetap open tanpa menelusuri bar,
+
+Tambahan opsional (default-nya tidak mengubah perilaku di atas): biaya round-trip (`cost`),
+model fill entry (`require_fill`; bar fill tidak pernah mengkredit TP), batas tunggu fill
+(`max_fill_bars` → status 'skipped'), dan batas tahan (`max_hold_bars` → exit timeout di
+close; status bisa 'win' | 'loss' | 'breakeven' lewat classify_r). Status touch TP tetap
+'win' walau biaya membuat R negatif.
+
 - rumus R (long: reward = exit - entry, risk = entry - sl; short cerminannya; r = reward/risk),
 - semua perhitungan dalam Decimal.
 """
@@ -26,13 +33,14 @@ class PriceBarLike(Protocol):
   """Kontrak minimal bar yang dibutuhkan resolver: high/low + waktu bar.
 
   Baik `backtest.Bar` maupun `resolver.PriceBar` memenuhi kontrak ini (duck typing).
+  Atribut `close: Optional[Decimal]` bersifat OPSIONAL dan sengaja tidak dideklarasikan
+  di sini supaya bar tanpa `close` tetap valid; resolver membacanya lewat
+  `getattr(bar, "close", None)` (hanya dipakai untuk exit timeout `max_hold_bars`).
   """
 
   bar_time: datetime
   high: Optional[Decimal]
   low: Optional[Decimal]
-  # close opsional (dibaca lewat getattr; bar duck-typed bisa tak punya field ini).
-  # close: Optional[Decimal]
 
 
 @dataclass(frozen=True)
@@ -49,7 +57,7 @@ class PriceBar:
 class Resolution:
   """Hasil resolusi satu trade. closed_at None → masih open (tak ada bar yang menyentuh)."""
 
-  status: str                       # 'win' | 'loss' | 'open'
+  status: str                       # 'win' | 'loss' | 'breakeven' | 'open' | 'skipped'
   exit_price: Optional[Decimal]
   r_multiple: Optional[Decimal]
   closed_at: Optional[datetime]
@@ -100,10 +108,21 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
   """
   if cost < 0:
     raise ValueError("cost tidak boleh negatif")
+  if max_fill_bars is not None and max_fill_bars < 1:
+    raise ValueError("max_fill_bars harus >= 1")
+  if max_hold_bars is not None and max_hold_bars < 1:
+    raise ValueError("max_hold_bars harus >= 1")
+  if max_fill_bars is not None and not require_fill:
+    # Tanpa model fill parameter ini tak berefek — tolak daripada diam-diam diabaikan.
+    raise ValueError("max_fill_bars hanya berlaku kalau require_fill=True")
   # Risk dihitung dulu supaya bisa guard pembagian nol sebelum menelusuri bar.
   risk = (entry - stop_loss) if direction == "long" else (stop_loss - entry)
   if risk == 0:
     return OPEN
+  if risk < 0:
+    # Level terbalik (long dengan SL >= entry / short dengan SL <= entry): biaya/risk
+    # akan berbalik tanda dan hasilnya tak bermakna → tolak.
+    raise ValueError("stop_loss berada di sisi yang salah dari entry")
 
   filled = not require_fill
   filled_at: Optional[datetime] = None
@@ -119,6 +138,12 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
     fill_bar = False
 
     if not filled:
+      # Keterbatasan yang disengaja: (1) fill akibat gap dianggap terjadi di `entry`,
+      # padahal harga tak pernah trade di sana (optimistis kalau harga melompati SL —
+      # tanpa harga open tak bisa dihitung lebih akurat); bar fill yang menembus SL
+      # tetap LOSS. (2) Bar terhitung PERTAMA tak punya bar sebelumnya dan resolver tak
+      # punya referensi bar sinyal, jadi gap di bar pertama tak terdeteksi (tidak terisi
+      # sampai ada bar yang menyentuh entry atau gap antar-bar berikutnya).
       touched = bar.low <= entry <= bar.high
       gapped = prev_bar is not None and (
         (prev_bar.high < entry and bar.low > entry)
