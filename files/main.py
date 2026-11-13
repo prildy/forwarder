@@ -8,7 +8,7 @@ import html
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
 from psycopg import errors as pg_errors
@@ -125,7 +125,10 @@ class Signal(_Base):
     timeframe: str
     bar_time: datetime
     bar_time_ms: int
-    triggers: list[str] = Field(min_length=1)
+    # Key wajib ada, list boleh kosong: bar tanpa trigger tetap disimpan untuk
+    # riwayat harga (resolver/backtest). Auto-capture melewati bar kosong, dan
+    # analisis manual memakai fetch_latest_alert(require_trigger=True).
+    triggers: list[Annotated[str, Field(min_length=1)]]
     candle: Candle
     liquidity_pools: LiquidityPools
     smc: Smc
@@ -272,11 +275,14 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
+def fetch_latest_alert(symbol: str, timeframe: str, *, require_trigger: bool = False) -> dict | None:
+    # require_trigger=True: lewati bar tanpa trigger (disimpan untuk riwayat harga),
+    # supaya analisis manual memakai sinyal nyata terakhir.
+    trigger_filter = "AND jsonb_array_length(payload->'triggers') > 0" if require_trigger else ""
     with POOL.connection() as conn:
         row = conn.execute(
-            """SELECT id, payload, bar_time FROM alerts
-               WHERE symbol = %s AND timeframe = %s
+            f"""SELECT id, payload, bar_time FROM alerts
+               WHERE symbol = %s AND timeframe = %s {trigger_filter}
                ORDER BY bar_time DESC LIMIT 1""",
             (symbol, timeframe),
         ).fetchone()
@@ -476,7 +482,7 @@ def journal_stats(symbol: str, mode: str) -> dict:
 async def run_hermes_analysis(symbol: str = DEFAULT_SYMBOL, timeframe: str = DEFAULT_TF,
                               trigger_src: str = "api") -> dict:
     # fungsi DB sync → jalankan di thread supaya event loop tidak ke-block
-    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe, require_trigger=True)
     if not alert:
         raise LookupError(f"Belum ada alert untuk {symbol}/{timeframe}")
 
@@ -751,7 +757,7 @@ async def analyze(token: str, bg: BackgroundTasks,
     if not hmac.compare_digest(token.encode(), ANALYZE_SECRET.encode()):
         raise HTTPException(status_code=404)
 
-    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe, require_trigger=True)
     if not alert:
         raise HTTPException(404, f"Belum ada alert untuk {symbol}/{timeframe}")
     age_min = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
