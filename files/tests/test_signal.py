@@ -116,6 +116,14 @@ def test_signal_empty_triggers_accepted():
   assert s.triggers == []
 
 
+def test_signal_blank_trigger_item_rejected():
+  p = _valid()
+  p["triggers"] = [""]
+  with pytest.raises(ValidationError) as ei:
+    main.Signal.model_validate(p)
+  assert any(loc.startswith("triggers") for loc in _locs(ei.value))
+
+
 def test_signal_missing_triggers_key_still_rejected():
   p = _valid()
   del p["triggers"]

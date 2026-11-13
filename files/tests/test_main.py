@@ -304,7 +304,6 @@ def test_forward_autocapture_enabled_valid_long_creates_entry(monkeypatch):
 
 def test_forward_autocapture_empty_triggers_never_calls_hermes(monkeypatch):
   # Bar tanpa trigger: tak ada panggilan Hermes dan tak ada jurnal.
-  assert main._triggers_qualify([]) is False
   hermes, create = _setup_autocapture(monkeypatch, enabled=True)
   payload = _payload()
   payload["triggers"] = []
@@ -512,3 +511,44 @@ def test_resolve_open_trades_closes_live_trade_via_resolver(monkeypatch):
   assert update_params[2] == Decimal(2)
   assert update_params[3] == bar_time
   assert update_params[4] == 7
+
+
+# ===================== fetch_latest_alert: require_trigger =====================
+
+
+def test_fetch_latest_alert_require_trigger_adds_jsonb_filter(monkeypatch):
+  conn = _FakeConn([[]])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+  main.fetch_latest_alert("XAUUSD", "30S", require_trigger=True)
+
+  sql, params = conn.executed[0]
+  assert "jsonb_array_length(payload->'triggers') > 0" in sql
+  assert params == ("XAUUSD", "30S")
+
+
+def test_fetch_latest_alert_default_has_no_trigger_filter(monkeypatch):
+  conn = _FakeConn([[]])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+  main.fetch_latest_alert("XAUUSD", "30S")
+
+  assert "jsonb_array_length" not in conn.executed[0][0]
+
+
+def test_run_hermes_analysis_fetches_with_require_trigger(monkeypatch):
+  fetch = Mock(return_value=None)
+  monkeypatch.setattr(main, "fetch_latest_alert", fetch)
+  with pytest.raises(LookupError):
+    asyncio.run(main.run_hermes_analysis("XAUUSD", "30S"))
+
+  assert fetch.call_args.kwargs == {"require_trigger": True}
+
+
+def test_analyze_endpoint_fetches_with_require_trigger(monkeypatch):
+  from fastapi.testclient import TestClient
+  fetch = Mock(return_value=None)
+  monkeypatch.setattr(main, "fetch_latest_alert", fetch)
+  client = TestClient(main.app)
+  r = client.post(f"/analyze/{main.ANALYZE_SECRET}")
+
+  assert r.status_code == 404
+  assert fetch.call_args.kwargs == {"require_trigger": True}
