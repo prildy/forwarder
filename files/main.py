@@ -252,6 +252,11 @@ def already_seen(event_id: str) -> bool:
     return False
 
 
+def forget_event(event_id: str) -> None:
+    # Lupakan event_id supaya replay alert yang gagal disimpan tidak dibuang sbg duplikat.
+    _seen.pop(event_id, None)
+
+
 def append_jsonl(name: str, record: dict) -> None:
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with open(LOG_DIR / f"{name}-{day}.jsonl", "a", encoding="utf-8") as f:
@@ -558,7 +563,18 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
 async def ingest_signal(payload: dict, bar_time: datetime) -> None:
     # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
     # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
-    await asyncio.to_thread(save_alert, payload, bar_time)
+    try:
+        await asyncio.to_thread(save_alert, payload, bar_time)
+    except Exception as e:
+        # Save gagal: lupakan event_id (agar replay diterima), catat error, jangan re-raise.
+        event_id = payload.get("event_id")
+        forget_event(event_id)
+        log.exception("save_alert gagal event=%s", event_id)
+        try:
+            append_jsonl("errors", {"event_id": event_id, "error": repr(e)})
+        except Exception:
+            log.exception("gagal menulis errors log event=%s", event_id)
+        return
     await forward_autocapture(payload, bar_time)
 
 

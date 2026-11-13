@@ -500,3 +500,48 @@ def test_resolve_open_trades_closes_live_trade_via_resolver(monkeypatch):
   assert update_params[2] == Decimal(2)
   assert update_params[3] == bar_time
   assert update_params[4] == 7
+
+
+# ===================== ingest_signal: save gagal =====================
+
+
+def test_ingest_signal_save_failure_forgets_event_and_skips_autocapture(monkeypatch):
+  main._seen.clear()
+  assert main.already_seen("evt-p2") is False
+  monkeypatch.setattr(main, "save_alert", Mock(side_effect=RuntimeError("db down")))
+  autocapture = AsyncMock()
+  monkeypatch.setattr(main, "forward_autocapture", autocapture)
+  logged = []
+  monkeypatch.setattr(main, "append_jsonl", lambda name, rec: logged.append((name, rec)))
+
+  asyncio.run(main.ingest_signal({"event_id": "evt-p2"}, datetime.now(timezone.utc)))
+
+  assert "evt-p2" not in main._seen
+  autocapture.assert_not_called()
+  assert len(logged) == 1
+  assert logged[0][0] == "errors"
+  assert logged[0][1]["event_id"] == "evt-p2"
+  assert "db down" in logged[0][1]["error"]
+  # replay event_id yang sama sekarang diterima
+  assert main.already_seen("evt-p2") is False
+  main._seen.clear()
+
+
+def test_ingest_signal_success_keeps_event_and_runs_autocapture(monkeypatch):
+  main._seen.clear()
+  main.already_seen("evt-ok")
+  monkeypatch.setattr(main, "save_alert", Mock())
+  autocapture = AsyncMock()
+  monkeypatch.setattr(main, "forward_autocapture", autocapture)
+
+  asyncio.run(main.ingest_signal({"event_id": "evt-ok"}, datetime.now(timezone.utc)))
+
+  assert main.already_seen("evt-ok") is True
+  autocapture.assert_called_once()
+  main._seen.clear()
+
+
+def test_forget_event_unknown_is_noop():
+  main._seen.clear()
+  main.forget_event("nope")
+  assert "nope" not in main._seen
