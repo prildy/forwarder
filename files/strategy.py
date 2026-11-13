@@ -76,6 +76,10 @@ def compute_levels(bar: BarLike, direction: str, use_swing: bool,
     return None
   entry = bar.close
 
+  # rr <= 0 menaruh TP di sisi yang salah dari entry → bukan level yang valid.
+  if rr <= 0:
+    return None
+
   if use_swing:
     # SL berbasis struktur: long pakai swing_low, short pakai swing_high.
     if direction == "long":
@@ -96,6 +100,9 @@ def compute_levels(bar: BarLike, direction: str, use_swing: bool,
   if bar.atr is None or bar.atr <= 0:
     return None
   offset = bar.atr * sl_atr
+  # sl_atr <= 0 → SL == entry (risk nol) atau terbalik; tolak sebagai bad_levels.
+  if offset <= 0:
+    return None
   if direction == "long":
     stop_loss = entry - offset
     take_profit = entry + offset * rr
@@ -139,9 +146,11 @@ def _dec(value) -> Optional[Decimal]:
   if value is None or isinstance(value, bool):
     return None
   try:
-    return Decimal(str(value))
+    number = Decimal(str(value))
   except ArithmeticError:
     return None
+  # NaN/Infinity lolos parsing tapi membuat perbandingan berikutnya error → anggap kosong.
+  return number if number.is_finite() else None
 
 
 def bar_from_payload(payload: dict) -> PayloadBar:

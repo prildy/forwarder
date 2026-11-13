@@ -241,7 +241,7 @@ def test_triggers_qualify_with_filter_no_intersection_is_false(monkeypatch):
 
 
 def _setup_autocapture(monkeypatch, *, enabled=True, hermes_content="",
-                       hermes_exc=None, has_open=False, min_conf=0.6):
+                       hermes_exc=None, has_open=False, min_conf=0.6, newer=False):
   """Pasang semua dependensi forward_autocapture dengan test double. Return (hermes, create)."""
   monkeypatch.setattr(main, "FORWARD_AUTOCAPTURE", enabled)
   monkeypatch.setattr(main, "FORWARD_TRIGGERS", set())
@@ -257,6 +257,7 @@ def _setup_autocapture(monkeypatch, *, enabled=True, hermes_content="",
   monkeypatch.setattr(main, "create_journal_entry", create)
   monkeypatch.setattr(main, "has_open_forward_trade", Mock(return_value=has_open))
   monkeypatch.setattr(main, "fetch_alert_id", Mock(return_value=7))
+  monkeypatch.setattr(main, "has_newer_alert", Mock(return_value=newer))
   return hermes, create
 
 
@@ -549,9 +550,8 @@ def _fresh_autocaptured(monkeypatch):
   monkeypatch.setattr(main, "_autocaptured", OrderedDict())
 
 
-def _setup_ingest(monkeypatch, *, newer=False, consulted=True):
+def _setup_ingest(monkeypatch, *, consulted=True):
   monkeypatch.setattr(main, "save_alert", Mock(return_value=True))
-  monkeypatch.setattr(main, "has_newer_alert", Mock(return_value=newer))
   autocapture = AsyncMock(return_value=consulted)
   monkeypatch.setattr(main, "forward_autocapture", autocapture)
   return autocapture
@@ -605,14 +605,25 @@ def test_ingest_signal_releases_key_when_autocapture_raises(monkeypatch, _fresh_
   assert not main._autocaptured
 
 
-def test_ingest_signal_skips_stale_out_of_order_bar(monkeypatch, _fresh_autocaptured):
-  # Sudah ada bar lebih baru → bar telat tidak boleh sampai ke Hermes.
-  autocapture = _setup_ingest(monkeypatch, newer=True)
-  main.save_alert.return_value = True
-  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+def test_forward_autocapture_skips_stale_out_of_order_bar(monkeypatch):
+  # Sudah ada bar lebih baru → bar telat tidak boleh sampai ke Hermes; return False
+  # (belum dikonsultasi) supaya kuncinya dilepas.
+  hermes, create = _setup_autocapture(monkeypatch, enabled=True, newer=True)
 
-  autocapture.assert_not_awaited()
-  main.save_alert.assert_called_once()     # tetap disimpan utk riwayat harga
+  assert asyncio.run(main.forward_autocapture(_payload(), _BAR)) is False
+  hermes.assert_not_called()
+  create.assert_not_called()
+
+
+def test_forward_autocapture_newer_check_runs_after_cheap_gates(monkeypatch):
+  # Bar kosong (tanpa trigger) tidak boleh memicu query has_newer_alert.
+  _setup_autocapture(monkeypatch, enabled=True)
+  payload = _payload()
+  payload["triggers"] = []
+  monkeypatch.setattr(main, "FORWARD_TRIGGERS", {"x"})
+
+  assert asyncio.run(main.forward_autocapture(payload, _BAR)) is False
+  main.has_newer_alert.assert_not_called()
 
 
 def test_ingest_signal_bounds_autocaptured_size(monkeypatch, _fresh_autocaptured):
@@ -781,7 +792,6 @@ def test_ingest_signal_success_keeps_event_and_runs_autocapture(monkeypatch, _fr
   main._seen.clear()
   main.already_seen("evt-ok")
   monkeypatch.setattr(main, "save_alert", Mock())
-  monkeypatch.setattr(main, "has_newer_alert", Mock(return_value=False))
   autocapture = AsyncMock(return_value=True)
   monkeypatch.setattr(main, "forward_autocapture", autocapture)
 
@@ -796,3 +806,70 @@ def test_forget_event_unknown_is_noop():
   main._seen.clear()
   main.forget_event("nope")
   assert "nope" not in main._seen
+
+
+# ===================== resolve_open_trades: level terbalik tidak menghentikan loop =====================
+
+
+def test_resolve_open_trades_skips_inverted_levels_and_resolves_the_rest(monkeypatch):
+  bar_time = datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)
+  opened = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  trades = [
+    # id 1: long dengan SL di atas entry (terbalik) -> resolver raise ValueError
+    (1, "FX:XAUUSD", "30S", "long", Decimal(100), Decimal(101), Decimal(102), opened),
+    # id 2: normal, TP tersentuh
+    (2, "FX:XAUUSD", "30S", "long", Decimal(100), Decimal(98), Decimal(102), opened),
+  ]
+  bars = [(bar_time, Decimal(103), Decimal(100))]
+  conn = _FakeConn([trades, bars, bars])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  resolved = main.resolve_open_trades()
+
+  assert resolved == 1
+  updates = [(sql, params) for sql, params in conn.executed if "UPDATE journal" in sql]
+  assert len(updates) == 1
+  assert updates[0][1][4] == 2          # hanya trade id 2 yang ditutup
+  assert updates[0][1][0] == "win"
+
+
+# ===================== /journal dan /status: pilih alert ber-trigger =====================
+
+
+def test_tg_cmd_journal_links_latest_signal_not_empty_bar(monkeypatch):
+  fetch = Mock(return_value={"id": 55, "payload": {}, "bar_time": _BAR})
+  monkeypatch.setattr(main, "fetch_latest_alert", fetch)
+  create = Mock(return_value=9)
+  monkeypatch.setattr(main, "create_journal_entry", create)
+  monkeypatch.setattr(main, "tg_send", AsyncMock())
+
+  asyncio.run(main.tg_cmd_journal(1, ["live", "long", "100", "99", "102"]))
+
+  assert fetch.call_args.kwargs == {"require_trigger": True}
+  assert create.call_args.args[8] == 55       # alert_id = sinyal ber-trigger
+
+
+def test_status_command_shows_latest_bar_and_last_signal(monkeypatch):
+  from fastapi.testclient import TestClient
+  now = datetime.now(timezone.utc)
+  latest = {"id": 1, "payload": {}, "bar_time": now}
+  signal = {"id": 2, "payload": {}, "bar_time": now - timedelta(minutes=90)}
+
+  def fake_fetch(symbol, timeframe, *, require_trigger=False):
+    return signal if require_trigger else latest
+
+  monkeypatch.setattr(main, "fetch_latest_alert", fake_fetch)
+  send = AsyncMock()
+  monkeypatch.setattr(main, "tg_send", send)
+  chat_id = next(iter(main.TG_ALLOWED))
+
+  r = TestClient(main.app).post(
+      "/telegram/webhook",
+      headers={"x-telegram-bot-api-secret-token": main.TG_SECRET},
+      json={"message": {"chat": {"id": chat_id}, "text": "/status"}},
+  )
+
+  assert r.status_code == 200
+  text = send.call_args.args[1]
+  assert "Alert terakhir" in text
+  assert "Sinyal terakhir" in text and "90 mnt" in text

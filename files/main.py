@@ -175,6 +175,7 @@ def migrate():
 def save_alert(p: dict, bar_time: datetime) -> bool:
     # Kembalikan True jika baris baru diinsert, False jika konflik (bar sudah ada).
     # psycopg set rowcount=0 saat DO NOTHING menyerap baris, 1 saat insert berhasil.
+    # Hanya informatif: ingest_signal sengaja TIDAK memakainya sebagai gate.
     with POOL.connection() as conn:
         cursor = conn.execute(
             """INSERT INTO alerts (symbol, timeframe, bar_time, payload)
@@ -425,7 +426,15 @@ def resolve_open_trades() -> int:
 
             bars = [resolver.PriceBar(bar_time=row[0], high=row[1], low=row[2])
                     for row in bar_rows]
-            outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
+            try:
+                outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
+            except ValueError:
+                # Level terbalik (mis. /journal long dengan sl > entry): resolver menolaknya.
+                # Satu baris rusak tidak boleh menghentikan resolusi trade lain di loop ini.
+                log.warning("journal %s: level tidak valid (%s e=%s sl=%s tp=%s), "
+                            "lewati auto-resolve", journal_id, direction, entry,
+                            stop_loss, take_profit)
+                continue
 
             if outcome.is_open:
                 # Risk nol (entry == sl) di-guard resolver jadi open — catat biar kelihatan.
@@ -548,6 +557,13 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> bool:
             log.debug("autocapture skip: triggers tidak memenuhi filter (%s)", triggers)
             return False
 
+        # Bar telat (out-of-order): sudah ada bar lebih baru → keputusan untuk bar ini basi.
+        # Dicek SETELAH gate murah di atas supaya bar kosong/non-primary tidak kena query DB.
+        if await asyncio.to_thread(has_newer_alert, symbol, timeframe, bar_time):
+            log.info("autocapture skip: bar %s %s/%s sudah tertinggal bar yang lebih baru",
+                     bar_time, symbol, timeframe)
+            return False
+
         # Anti-pyramiding: satu forward trade open per symbol+tf.
         if await asyncio.to_thread(has_open_forward_trade, symbol, timeframe):
             log.info("autocapture skip: masih ada forward trade open %s/%s", symbol, timeframe)
@@ -606,8 +622,10 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> bool:
 async def ingest_signal(payload: dict, bar_time: datetime) -> None:
     # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
     # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
-    # Hasil save_alert (insert vs ON CONFLICT) sengaja tidak dipakai sebagai gate:
-    # alert kedua untuk bar yang sama bisa membawa trigger berbeda (split konteks+signal).
+    # Desain: SATU alert per bar. Hasil save_alert (insert vs ON CONFLICT) sengaja tidak
+    # dipakai sebagai gate; duplikat bar dicegah oleh guard _autocaptured di bawah.
+    # Catatan: kalau dua alert berbeda tiba untuk bar yang sama, ON CONFLICT DO NOTHING
+    # membuang payload kedua (trigger-nya tidak tersimpan) — itu di luar desain ini.
     try:
         await asyncio.to_thread(save_alert, payload, bar_time)
     except Exception as e:
@@ -623,12 +641,6 @@ async def ingest_signal(payload: dict, bar_time: datetime) -> None:
 
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe")
-
-    # Bar telat (out-of-order): sudah ada bar lebih baru → keputusan untuk bar ini basi.
-    if await asyncio.to_thread(has_newer_alert, symbol, timeframe, bar_time):
-        log.info("ingest skip: bar %s %s/%s sudah tertinggal bar yang lebih baru",
-                 bar_time, symbol, timeframe)
-        return
 
     # Satu bar = satu konsultasi Hermes. Key ditandai sebelum await (cegah race dua
     # task paralel) dan dilepas lagi bila Hermes belum berhasil dikonsultasi, jadi
@@ -901,8 +913,10 @@ async def tg_cmd_journal(chat_id: int, args: list[str]) -> None:
     elif direction == "short" and not (take_profit < entry < stop_loss):
         warn = "\n⚠️ Catatan: untuk short normalnya tp < entry < sl."
 
-    # Tautkan alert terbaru sebagai konteks; analysis_id dibiarkan NULL dulu.
-    alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
+    # Tautkan alert ber-trigger terakhir (sinyal yang di-trade), bukan bar harga kosong;
+    # analysis_id dibiarkan NULL dulu.
+    alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF,
+                                    require_trigger=True)
     alert_id = alert["id"] if alert else None
 
     try:
@@ -1050,10 +1064,21 @@ async def telegram_webhook(request: Request, bg: BackgroundTasks):
     elif cmd == "/status":
         alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
         if alert:
-            age = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
-            await tg_send(chat_id, f"Alert terakhir {DEFAULT_SYMBOL} {DEFAULT_TF}: "
-                                   f"{alert['bar_time'].isoformat()} ({age:.0f} mnt lalu)",
-                          reply_markup=analyze_button())
+            now = datetime.now(timezone.utc)
+            age = (now - alert["bar_time"]).total_seconds() / 60
+            text = (f"Alert terakhir {DEFAULT_SYMBOL} {DEFAULT_TF}: "
+                    f"{alert['bar_time'].isoformat()} ({age:.0f} mnt lalu)")
+            # Bar tanpa trigger ikut tersimpan → tampilkan juga sinyal terakhir, supaya
+            # status "segar" tidak menutupi sinyal yang sudah lama (cocok dengan /analyze).
+            signal = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF,
+                                             require_trigger=True)
+            if signal:
+                sig_age = (now - signal["bar_time"]).total_seconds() / 60
+                text += (f"\nSinyal terakhir: {signal['bar_time'].isoformat()} "
+                         f"({sig_age:.0f} mnt lalu)")
+            else:
+                text += "\nSinyal terakhir: belum ada"
+            await tg_send(chat_id, text, reply_markup=analyze_button())
         else:
             await tg_send(chat_id, "Belum ada alert tersimpan.")
     elif cmd == "/journal":

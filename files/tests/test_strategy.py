@@ -154,3 +154,43 @@ def test_bar_from_payload_feeds_propose():
   proposal, reason = propose(bar_from_payload(payload), _params())
   assert reason is None
   assert proposal.direction == "long"
+
+
+# ===================== level tidak valid & angka non-finite =====================
+
+
+@pytest.mark.parametrize("sl_atr,rr", [
+  (Decimal("0"), Decimal("2")),      # SL == entry
+  (Decimal("-1"), Decimal("2")),     # SL terbalik
+  (Decimal("1.5"), Decimal("0")),    # TP == entry
+  (Decimal("1.5"), Decimal("-1")),   # TP terbalik
+])
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_compute_levels_rejects_non_positive_sl_atr_or_rr(direction, sl_atr, rr):
+  bar = PayloadBar(close=Decimal("100"), atr=Decimal("2"), triggers=["x"],
+                   structure_trend="bullish", swing_high=None, swing_low=None)
+
+  assert strategy.compute_levels(bar, direction, False, sl_atr, rr) is None
+
+
+def test_compute_levels_swing_rejects_non_positive_rr():
+  bar = PayloadBar(close=Decimal("100"), atr=Decimal("2"), triggers=["x"],
+                   structure_trend="bullish", swing_high=None, swing_low=Decimal("98"))
+
+  assert strategy.compute_levels(bar, "long", True, Decimal("1.5"), Decimal("0")) is None
+
+
+@pytest.mark.parametrize("raw", ["NaN", "nan", "Infinity", "-Infinity", float("nan"), float("inf")])
+def test_bar_from_payload_non_finite_numbers_become_none(raw):
+  bar = strategy.bar_from_payload({"candle": {"close": 100, "atr": raw}, "triggers": ["x"]})
+
+  assert bar.atr is None
+
+
+def test_propose_nan_atr_returns_bad_levels_instead_of_raising():
+  bar = strategy.bar_from_payload({"candle": {"close": 100, "atr": "NaN"},
+                                   "triggers": ["x"], "smc": {"structure_trend": "bullish"}})
+  params = EntryParams(direction_override="auto", use_swing=False, qualifying_triggers=None,
+                       sl_atr=Decimal("1.5"), rr=Decimal("2"), allow_overlap=False)
+
+  assert strategy.propose(bar, params) == (None, "bad_levels")
