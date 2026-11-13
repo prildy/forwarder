@@ -33,6 +33,7 @@ import psycopg
 
 import resolver
 from resolver import Resolution
+from strategy import EntryParams, compute_levels, propose, resolve_direction  # noqa: F401
 
 # Mode jurnal yang HARAM disentuh script ini — hanya 'backtest' yang boleh ditulis/dihapus.
 PROTECTED_MODES = ("live", "forward")
@@ -180,66 +181,6 @@ def resolve_trade(direction: str, entry: Decimal, stop_loss: Decimal,
 # ===================== Service layer: entry rule (jantung yang bisa di-tune) =====================
 
 
-def resolve_direction(bar: Bar, override: str) -> Optional[str]:
-  # override 'long'/'short' memaksa arah; 'auto' baca smc.structure_trend.
-  if override in ("long", "short"):
-    return override
-
-  trend = (bar.structure_trend or "").lower()
-  if "bull" in trend:
-    return "long"
-  if "bear" in trend:
-    return "short"
-  # Netral / kosong / tak dikenal → tidak ada trade.
-  return None
-
-
-def compute_levels(bar: Bar, direction: str, use_swing: bool,
-                   sl_atr: Decimal, rr: Decimal) -> Optional[tuple[Decimal, Decimal, Decimal]]:
-  """Kembalikan (entry, stop_loss, take_profit) Decimal, atau None kalau bar tak layak."""
-  if bar.close is None:
-    return None
-  entry = bar.close
-
-  if use_swing:
-    # SL berbasis struktur: long pakai swing_low, short pakai swing_high.
-    if direction == "long":
-      stop_loss = bar.swing_low
-      if stop_loss is None or stop_loss >= entry:
-        return None
-      risk = entry - stop_loss
-      take_profit = entry + risk * rr
-    else:
-      stop_loss = bar.swing_high
-      if stop_loss is None or stop_loss <= entry:
-        return None
-      risk = stop_loss - entry
-      take_profit = entry - risk * rr
-    return entry, stop_loss, take_profit
-
-  # Default: SL/TP berbasis ATR bar tersebut.
-  if bar.atr is None or bar.atr <= 0:
-    return None
-  offset = bar.atr * sl_atr
-  if direction == "long":
-    stop_loss = entry - offset
-    take_profit = entry + offset * rr
-  else:
-    stop_loss = entry + offset
-    take_profit = entry - offset * rr
-  return entry, stop_loss, take_profit
-
-
-@dataclass(frozen=True)
-class EntryParams:
-  direction_override: str           # 'auto' | 'long' | 'short'
-  qualifying_triggers: Optional[set[str]]   # None = semua bar bertrigger lolos
-  use_swing: bool
-  sl_atr: Decimal
-  rr: Decimal
-  allow_overlap: bool
-
-
 def generate_trades(bars: list[Bar], params: EntryParams) -> tuple[list[GeneratedTrade], dict]:
   """Replay bar jadi trade. Terapkan filter trigger, arah, SL/TP, dan no-pyramiding.
 
@@ -264,30 +205,14 @@ def generate_trades(bars: list[Bar], params: EntryParams) -> tuple[list[Generate
         skipped["overlap"] += 1
         continue
 
-    # Guard: trigger wajib non-empty.
-    if not bar.triggers:
-      skipped["no_trigger"] += 1
+    # Guard (trigger, filter, arah, level) didelegasikan ke strategy.propose.
+    proposal, reason = propose(bar, params)
+    if proposal is None:
+      skipped[reason] += 1
       continue
 
-    # Guard: filter trigger qualifying (kalau di-set).
-    if params.qualifying_triggers is not None:
-      if not (set(bar.triggers) & params.qualifying_triggers):
-        skipped["trigger_filter"] += 1
-        continue
-
-    # Guard: arah harus jelas.
-    direction = resolve_direction(bar, params.direction_override)
-    if direction is None:
-      skipped["no_direction"] += 1
-      continue
-
-    # Guard: level entry/SL/TP harus valid.
-    levels = compute_levels(bar, direction, params.use_swing, params.sl_atr, params.rr)
-    if levels is None:
-      skipped["bad_levels"] += 1
-      continue
-
-    entry, stop_loss, take_profit = levels
+    direction = proposal.direction
+    entry, stop_loss, take_profit = proposal.entry, proposal.stop_loss, proposal.take_profit
     resolution = resolve_trade(direction, entry, stop_loss, take_profit, bar.bar_time, bars)
     trades.append(
         GeneratedTrade(bar=bar, direction=direction, entry=entry,
