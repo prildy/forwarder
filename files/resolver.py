@@ -76,7 +76,8 @@ def classify_r(r: Decimal) -> str:
 def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
             take_profit: Decimal, bars: Iterable[PriceBarLike], *,
             cost: Decimal = Decimal(0), require_fill: bool = False,
-            max_fill_bars: Optional[int] = None) -> Resolution:
+            max_fill_bars: Optional[int] = None,
+            max_hold_bars: Optional[int] = None) -> Resolution:
   """Resolusi satu trade terhadap deretan bar yang SUDAH terurut waktu naik.
 
   `bars` wajib hanya berisi bar SETELAH entry (pemfilteran bar_time > opened_at adalah
@@ -90,6 +91,12 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
   menyentuh/melompati entry. Di bar fill hanya SL yang dicek (worst-case, TP tak pernah
   dikreditkan di bar fill). Bar tanpa high/low dilewati dan tidak dihitung.
   `max_fill_bars` → batas jumlah bar (terhitung) menunggu fill; lewat batas → 'skipped'.
+
+  `max_hold_bars` → batas lama menahan posisi. Bar terhitung dimulai dari bar fill
+  (bar fill = 1) kalau require_fill=True, selain itu dari bar terhitung pertama. Setelah
+  SL/TP dievaluasi di bar ke-`max_hold_bars` tanpa sentuhan, posisi ditutup di `close`
+  bar itu (exit_reason='timeout'); kalau close None, ditunda ke bar berikutnya yang
+  punya close (SL/TP tetap dievaluasi lebih dulu di bar-bar itu).
   """
   if cost < 0:
     raise ValueError("cost tidak boleh negatif")
@@ -102,6 +109,7 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
   filled_at: Optional[datetime] = None
   counted = 0   # jumlah bar terhitung (high & low ada), dipakai untuk batas fill
   prev = None   # bar terhitung sebelumnya, untuk deteksi lompatan (gap) melewati entry
+  held = 0      # jumlah bar terhitung sejak posisi aktif (bar fill = 1)
 
   for bar in bars:
     if bar.high is None or bar.low is None:
@@ -134,7 +142,19 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
     if fill_bar:
       hit_tp = False
 
+    held += 1
+
     if not hit_tp and not hit_sl:
+      # Timeout: tutup di close bar ini (SL/TP sudah dicek dan tidak tersentuh).
+      close = getattr(bar, "close", None)
+      if max_hold_bars is not None and held >= max_hold_bars and close is not None:
+        reward = (close - entry) if direction == "long" else (entry - close)
+        gross_r = reward / risk
+        r_multiple = gross_r - (cost / risk)
+        return Resolution(status=classify_r(r_multiple), exit_price=close,
+                          r_multiple=r_multiple, closed_at=bar.bar_time,
+                          gross_r=gross_r, filled_at=filled_at,
+                          exit_reason="timeout")
       continue
 
     # Worst-case intrabar: kalau satu bar menyentuh SL dan TP sekaligus,

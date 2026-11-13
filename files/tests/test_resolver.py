@@ -472,3 +472,187 @@ def test_fill_with_cost_closed_result_carries_filled_at_and_net_r():
   assert res.gross_r == Decimal("2")
   assert res.r_multiple == Decimal("1.8")
   assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+# --- M4: batas waktu tahan posisi ---
+
+def _cbar(minutes: int, *, high, low, close=None) -> PriceBar:
+  def dec(value):
+    return Decimal(str(value)) if value is not None else None
+
+  return PriceBar(bar_time=T0 + timedelta(minutes=minutes), high=dec(high),
+                  low=dec(low), close=dec(close))
+
+
+def test_timeout_in_profit_is_win_long():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100), _cbar(2, high=101, low=100, close=101)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=2)
+  assert res.status == "win"
+  assert res.exit_reason == "timeout"
+  assert res.exit_price == Decimal("101")
+  assert res.gross_r == Decimal("0.5")
+  assert res.closed_at == T0 + timedelta(minutes=2)
+
+
+def test_timeout_in_loss_is_loss_short():
+  bars = [_cbar(1, high=101, low=99.5, close=101)]
+  res = resolve("short", Decimal("100"), Decimal("104"), Decimal("90"), bars,
+                max_hold_bars=1)
+  assert res.status == "loss"
+  assert res.r_multiple == Decimal("-0.25")
+  assert res.exit_reason == "timeout"
+
+
+def test_timeout_near_zero_is_breakeven():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100.05)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=1)
+  assert res.status == "breakeven"
+  assert res.exit_reason == "timeout"
+
+
+def test_timeout_cost_can_turn_small_win_into_loss():
+  bars = [_cbar(1, high=101, low=99.5, close=100.5)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                cost=Decimal("1"), max_hold_bars=1)
+  assert res.gross_r == Decimal("0.25")
+  assert res.r_multiple == Decimal("-0.25")
+  assert res.status == "loss"
+
+
+def test_sl_touch_on_timeout_bar_wins_over_timeout():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100), _cbar(2, high=100.5, low=97, close=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=2)
+  assert res.status == "loss"
+  assert res.exit_reason == "sl"
+
+
+def test_tp_touch_on_timeout_bar_wins_over_timeout():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100), _cbar(2, high=110, low=100, close=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=2)
+  assert res.exit_reason == "tp"
+
+
+def test_close_none_defers_timeout_to_next_bar_with_close():
+  bars = [_cbar(1, high=100.5, low=99.5, close=None),
+          _cbar(2, high=100.5, low=99.5, close=None),
+          _cbar(3, high=101, low=99.5, close=100.8)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=1)
+  assert res.exit_reason == "timeout"
+  assert res.closed_at == T0 + timedelta(minutes=3)
+  assert res.exit_price == Decimal("100.8")
+
+
+def test_deferred_timeout_still_checks_sl_on_later_bars():
+  bars = [_cbar(1, high=100.5, low=99.5, close=None),
+          _cbar(2, high=100.5, low=97, close=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=1)
+  assert res.exit_reason == "sl"
+
+
+def test_duck_typed_bar_without_close_never_times_out():
+  from types import SimpleNamespace
+  bars = [SimpleNamespace(bar_time=T0 + timedelta(minutes=i), high=Decimal("100.5"),
+                          low=Decimal("99.5")) for i in range(1, 4)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=1)
+  assert res is resolver.OPEN
+
+
+def test_max_hold_bars_none_keeps_old_behaviour():
+  bars = [_cbar(i, high=100.5, low=99.5, close=100) for i in range(1, 50)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars)
+  assert res is resolver.OPEN
+
+
+def test_not_yet_at_max_hold_stays_open():
+  bars = [_cbar(i, high=100.5, low=99.5, close=100) for i in range(1, 3)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=3)
+  assert res is resolver.OPEN
+
+
+def test_none_bars_not_counted_for_hold():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100), _cbar(2, high=None, low=None, close=100),
+          _cbar(3, high=100.5, low=99.5, close=100.4)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=2)
+  assert res.closed_at == T0 + timedelta(minutes=3)
+
+
+def test_hold_count_starts_at_first_bar_without_fill_model():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100.2)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                max_hold_bars=1)
+  assert res.exit_reason == "timeout"
+  assert res.filled_at is None
+
+
+# --- M3 x M4: hold dihitung mulai bar fill ---
+
+def test_hold_counting_starts_at_fill_bar_not_first_bar():
+  # bar 1-2 menunggu fill (tidak dihitung hold); fill di bar 3 (=hold 1), bar 4 = hold 2.
+  bars = [_cbar(1, high=105, low=104, close=104.5), _cbar(2, high=105, low=104, close=104.5),
+          _cbar(3, high=100.5, low=99.5, close=100.2), _cbar(4, high=100.8, low=99.8, close=100.6)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_hold_bars=2)
+  assert res.exit_reason == "timeout"
+  assert res.closed_at == T0 + timedelta(minutes=4)
+  assert res.filled_at == T0 + timedelta(minutes=3)
+  assert res.exit_price == Decimal("100.6")
+
+
+def test_not_timed_out_before_hold_reached_after_fill():
+  bars = [_cbar(1, high=105, low=104, close=104.5), _cbar(2, high=100.5, low=99.5, close=100.2),
+          _cbar(3, high=100.8, low=99.8, close=100.6)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_hold_bars=3)
+  assert res.is_open
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_max_hold_one_times_out_on_fill_bar_at_close():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100.3)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_hold_bars=1)
+  assert res.exit_reason == "timeout"
+  assert res.filled_at == res.closed_at == T0 + timedelta(minutes=1)
+
+
+def test_fill_bar_tp_touch_not_credited_then_timeout_at_close():
+  # TP tersentuh di bar fill tidak dikreditkan; max_hold=1 → keluar di close bar fill.
+  bars = [_cbar(1, high=111, low=99.5, close=100.5)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_hold_bars=1)
+  assert res.exit_reason == "timeout"
+  assert res.exit_price == Decimal("100.5")
+
+
+def test_fill_bar_sl_touch_beats_timeout_on_fill_bar():
+  bars = [_cbar(1, high=100.5, low=97, close=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_hold_bars=1)
+  assert res.exit_reason == "sl"
+
+
+def test_no_fill_skips_even_with_max_hold_set():
+  bars = [_cbar(i, high=105, low=104, close=104.5) for i in range(1, 4)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                require_fill=True, max_fill_bars=2, max_hold_bars=1)
+  assert res.status == "skipped"
+  assert res.exit_reason == "no_fill"
+
+
+def test_timeout_after_fill_carries_cost_and_filled_at():
+  bars = [_cbar(1, high=100.5, low=99.5, close=100.2), _cbar(2, high=101.5, low=100, close=101)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("110"), bars,
+                cost=Decimal("0.4"), require_fill=True, max_hold_bars=2)
+  assert res.gross_r == Decimal("0.5")
+  assert res.r_multiple == Decimal("0.3")
+  assert res.status == "win"
+  assert res.filled_at == T0 + timedelta(minutes=1)
