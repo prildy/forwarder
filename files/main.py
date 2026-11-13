@@ -161,6 +161,10 @@ class ForwardTradeExists(Exception):
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
 _seen: "OrderedDict[str, None]" = OrderedDict()
 
+# Bar (symbol, tf, bar_time) yang sudah/sedang dikonsultasikan ke Hermes. Dipakai supaya
+# satu bar tidak memicu dua panggilan Hermes, tapi bar yang gagal/terlewat boleh dicoba lagi.
+_autocaptured: "OrderedDict[tuple, None]" = OrderedDict()
+
 def migrate():
     with POOL.connection() as conn, open("schema.sql") as f:
         conn.execute(f.read())
@@ -279,6 +283,29 @@ def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
     if not row:
         return None
     return {"id": row[0], "payload": row[1], "bar_time": row[2]}
+
+
+def fetch_alert_id(symbol: str, timeframe: str, bar_time: datetime) -> int | None:
+    # Cocokkan persis pada unique key alerts — bukan "alert terbaru" — supaya jurnal
+    # untuk bar yang telat tidak tertaut ke alert bar yang lebih baru.
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT id FROM alerts
+               WHERE symbol = %s AND timeframe = %s AND bar_time = %s""",
+            (symbol, timeframe, bar_time),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def has_newer_alert(symbol: str, timeframe: str, bar_time: datetime) -> bool:
+    # True jika sudah ada bar yang lebih baru dari bar_time (bar ini datang terlambat).
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM alerts
+               WHERE symbol = %s AND timeframe = %s AND bar_time > %s LIMIT 1""",
+            (symbol, timeframe, bar_time),
+        ).fetchone()
+    return row is not None
 
 # ===================== Trade journal (DB helpers) =====================
 # Semua fungsi di sini sinkron (pakai POOL) → dipanggil lewat asyncio.to_thread.
@@ -483,65 +510,69 @@ def _levels_sane(direction: str, entry: float, stop_loss: float, take_profit: fl
     return take_profit < entry < stop_loss
 
 
-async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
+async def forward_autocapture(payload: dict, bar_time: datetime) -> bool:
     """Hermes-driven forward test: dari satu signal live, minta keputusan ke Hermes,
     lalu kalau layak buat jurnal mode='forward' yang nanti ditutup resolver 1 menit.
 
     Seluruh badan dibungkus try/except: kegagalan apa pun (Hermes mati, parse jelek)
     dicatat lalu ditelan — tidak boleh mengganggu ingesti webhook.
+
+    Return True hanya jika Hermes sudah berhasil dikonsultasi untuk bar ini; skip sebelum
+    Hermes (gate, trigger, trade open) atau Hermes gagal → False, supaya bar boleh dicoba lagi.
     """
     if not FORWARD_AUTOCAPTURE:
-        return
+        return False
 
+    consulted = False
     try:
         symbol = payload.get("symbol")
         timeframe = payload.get("timeframe")
         # Gate instrumen utama: forward-capture hanya untuk DEFAULT_SYMBOL/DEFAULT_TF.
         if symbol != DEFAULT_SYMBOL or timeframe != DEFAULT_TF:
             log.debug("autocapture skip: symbol/tf bukan primary (%s/%s)", symbol, timeframe)
-            return
+            return False
 
         triggers = payload.get("triggers") or []
         if not _triggers_qualify(triggers):
             log.debug("autocapture skip: triggers tidak memenuhi filter (%s)", triggers)
-            return
+            return False
 
         # Anti-pyramiding: satu forward trade open per symbol+tf.
         if await asyncio.to_thread(has_open_forward_trade, symbol, timeframe):
             log.info("autocapture skip: masih ada forward trade open %s/%s", symbol, timeframe)
-            return
+            return False
 
         received_at = datetime.now(timezone.utc).isoformat()
         content, _ = await forward_to_hermes(payload, received_at)
+        consulted = True
         decision = parse_hermes_decision(content)
         if decision is None:
             log.info("autocapture skip: respons Hermes tak terparse jadi keputusan")
-            return
+            return True
 
         if decision["decision"] not in ("long", "short"):
             log.info("autocapture skip: decision=%s (no_trade)", decision["decision"])
-            return
+            return True
 
         if decision["confidence"] < FORWARD_MIN_CONFIDENCE:
             log.info("autocapture skip: confidence %.2f < %.2f",
                      decision["confidence"], FORWARD_MIN_CONFIDENCE)
-            return
+            return True
 
         entry = decision["entry"]
         stop_loss = decision["stop_loss"]
         take_profit = decision["take_profit"]
         if entry is None or stop_loss is None or take_profit is None:
             log.info("autocapture skip: level entry/sl/tp tidak lengkap")
-            return
+            return True
 
         if not _levels_sane(decision["decision"], entry, stop_loss, take_profit):
             log.info("autocapture skip: level tidak masuk akal utk %s (e=%s sl=%s tp=%s)",
                      decision["decision"], entry, stop_loss, take_profit)
-            return
+            return True
 
-        # Tautkan alert terbaru (yang baru saja disimpan) sebagai konteks jurnal.
-        alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
-        alert_id = alert["id"] if alert else None
+        # Tautkan alert milik bar ini (cocok persis unique key) sebagai konteks jurnal.
+        alert_id = await asyncio.to_thread(fetch_alert_id, symbol, timeframe, bar_time)
 
         setup_tags = decision["setup_tags"] or list(triggers)
         journal_id = await asyncio.to_thread(
@@ -551,22 +582,50 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
         log.info("autocapture: jurnal forward #%s dibuat %s e=%s sl=%s tp=%s conf=%.2f",
                  journal_id, decision["decision"], entry, stop_loss, take_profit,
                  decision["confidence"])
+        return True
     except ForwardTradeExists:
         # Race: webhook lain sudah buka forward trade duluan (unique index menolak).
         log.info("autocapture skip: sudah ada forward trade terbuka, lewati")
+        return True
     except Exception:  # noqa: BLE001
         log.exception("autocapture gagal (diabaikan, webhook tetap aman)")
+        return consulted
 
 
 async def ingest_signal(payload: dict, bar_time: datetime) -> None:
     # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
     # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
-    # Guard duplikat bar out-of-order: kalau save_alert mengembalikan False berarti
-    # ON CONFLICT DO NOTHING menyerap baris — bar sudah ada, skip forward_autocapture
-    # agar tidak ada dua panggilan Hermes + dua percobaan forward untuk bar yang sama.
-    inserted = await asyncio.to_thread(save_alert, payload, bar_time)
-    if inserted:
-        await forward_autocapture(payload, bar_time)
+    # Hasil save_alert (insert vs ON CONFLICT) sengaja tidak dipakai sebagai gate:
+    # alert kedua untuk bar yang sama bisa membawa trigger berbeda (split konteks+signal).
+    await asyncio.to_thread(save_alert, payload, bar_time)
+
+    symbol = payload.get("symbol")
+    timeframe = payload.get("timeframe")
+
+    # Bar telat (out-of-order): sudah ada bar lebih baru → keputusan untuk bar ini basi.
+    if await asyncio.to_thread(has_newer_alert, symbol, timeframe, bar_time):
+        log.info("ingest skip: bar %s %s/%s sudah tertinggal bar yang lebih baru",
+                 bar_time, symbol, timeframe)
+        return
+
+    # Satu bar = satu konsultasi Hermes. Key ditandai sebelum await (cegah race dua
+    # task paralel) dan dilepas lagi bila Hermes belum berhasil dikonsultasi, jadi
+    # kegagalan/skip pra-Hermes tidak mengunci bar itu selamanya.
+    key = (symbol, timeframe, bar_time)
+    if key in _autocaptured:
+        log.info("ingest skip: bar %s %s/%s sudah dikonsultasikan ke Hermes",
+                 bar_time, symbol, timeframe)
+        return
+    _autocaptured[key] = None
+    if len(_autocaptured) > DEDUPE_SIZE:
+        _autocaptured.popitem(last=False)
+
+    consulted = False
+    try:
+        consulted = await forward_autocapture(payload, bar_time)
+    finally:
+        if not consulted:
+            _autocaptured.pop(key, None)
 
 
 def cleanup_old_data():

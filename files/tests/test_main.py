@@ -256,8 +256,7 @@ def _setup_autocapture(monkeypatch, *, enabled=True, hermes_content="",
   create = Mock(return_value=123)
   monkeypatch.setattr(main, "create_journal_entry", create)
   monkeypatch.setattr(main, "has_open_forward_trade", Mock(return_value=has_open))
-  monkeypatch.setattr(main, "fetch_latest_alert",
-                      Mock(return_value={"id": 7, "payload": {}, "bar_time": None}))
+  monkeypatch.setattr(main, "fetch_alert_id", Mock(return_value=7))
   return hermes, create
 
 
@@ -298,7 +297,7 @@ def test_forward_autocapture_enabled_valid_long_creates_entry(monkeypatch):
   assert args[5] == 99.0
   assert args[6] == 102.0
   assert args[7] == ["bbma"]
-  assert args[8] == 7          # alert_id dari fetch_latest_alert
+  assert args[8] == 7          # alert_id dari fetch_alert_id (cocok persis per bar)
   assert args[9] is None       # analysis_id
 
 
@@ -529,63 +528,173 @@ def test_save_alert_returns_false_on_conflict(monkeypatch):
   assert result is False
 
 
-# ===================== ingest_signal: guard duplikat bar out-of-order =====================
+# ===================== ingest_signal: guard per-bar =====================
 
 
-def test_ingest_signal_calls_forward_autocapture_when_inserted(monkeypatch):
-  # save_alert kembalikan True → forward_autocapture harus dipanggil sekali.
+@pytest.fixture
+def _fresh_autocaptured(monkeypatch):
+  # State modul dipakai lintas test → pakai instance baru per test.
+  from collections import OrderedDict
+  monkeypatch.setattr(main, "_autocaptured", OrderedDict())
+
+
+def _setup_ingest(monkeypatch, *, newer=False, consulted=True):
   monkeypatch.setattr(main, "save_alert", Mock(return_value=True))
-  mock_autocapture = AsyncMock()
-  monkeypatch.setattr(main, "forward_autocapture", mock_autocapture)
-
-  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
-  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
-  asyncio.run(main.ingest_signal(payload, bar_time))
-
-  mock_autocapture.assert_awaited_once_with(payload, bar_time)
+  monkeypatch.setattr(main, "has_newer_alert", Mock(return_value=newer))
+  autocapture = AsyncMock(return_value=consulted)
+  monkeypatch.setattr(main, "forward_autocapture", autocapture)
+  return autocapture
 
 
-def test_ingest_signal_skips_forward_autocapture_on_conflict(monkeypatch):
-  # save_alert kembalikan False (bar sudah ada, out-of-order dup) →
-  # forward_autocapture harus dilewati agar tidak ada dua panggilan Hermes.
-  monkeypatch.setattr(main, "save_alert", Mock(return_value=False))
-  mock_autocapture = AsyncMock()
-  monkeypatch.setattr(main, "forward_autocapture", mock_autocapture)
+_BAR = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_ALERT = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
 
-  bar_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
-  payload = {"symbol": "FX:XAUUSD", "timeframe": "30S"}
-  asyncio.run(main.ingest_signal(payload, bar_time))
 
-  mock_autocapture.assert_not_awaited()
+def test_ingest_signal_calls_forward_autocapture_when_inserted(monkeypatch, _fresh_autocaptured):
+  autocapture = _setup_ingest(monkeypatch)
+  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+
+  autocapture.assert_awaited_once_with(_ALERT, _BAR)
+
+
+def test_ingest_signal_conflict_alone_does_not_skip_autocapture(monkeypatch, _fresh_autocaptured):
+  # Alert kedua utk bar yang sama (save_alert=False, trigger berbeda) belum pernah
+  # dikonsultasikan → tetap harus diteruskan (mis. split konteks + signal).
+  autocapture = _setup_ingest(monkeypatch)
+  main.save_alert.return_value = False
+  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+
+  autocapture.assert_awaited_once()
+
+
+def test_ingest_signal_skips_bar_already_consulted(monkeypatch, _fresh_autocaptured):
+  # Hermes sudah dikonsultasi utk bar ini → alert duplikat tidak memicu panggilan kedua.
+  autocapture = _setup_ingest(monkeypatch, consulted=True)
+  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+  asyncio.run(main.ingest_signal(dict(_ALERT), _BAR))
+
+  autocapture.assert_awaited_once()
+
+
+def test_ingest_signal_retries_bar_when_hermes_not_consulted(monkeypatch, _fresh_autocaptured):
+  # Hermes gagal / skip pra-Hermes (return False) → bar tidak terkunci, re-send boleh coba lagi.
+  autocapture = _setup_ingest(monkeypatch, consulted=False)
+  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+  asyncio.run(main.ingest_signal(dict(_ALERT), _BAR))
+
+  assert autocapture.await_count == 2
+
+
+def test_ingest_signal_releases_key_when_autocapture_raises(monkeypatch, _fresh_autocaptured):
+  autocapture = _setup_ingest(monkeypatch)
+  autocapture.side_effect = RuntimeError("boom")
+
+  with pytest.raises(RuntimeError):
+    asyncio.run(main.ingest_signal(_ALERT, _BAR))
+  assert not main._autocaptured
+
+
+def test_ingest_signal_skips_stale_out_of_order_bar(monkeypatch, _fresh_autocaptured):
+  # Sudah ada bar lebih baru → bar telat tidak boleh sampai ke Hermes.
+  autocapture = _setup_ingest(monkeypatch, newer=True)
+  main.save_alert.return_value = True
+  asyncio.run(main.ingest_signal(_ALERT, _BAR))
+
+  autocapture.assert_not_awaited()
+  main.save_alert.assert_called_once()     # tetap disimpan utk riwayat harga
+
+
+def test_ingest_signal_bounds_autocaptured_size(monkeypatch, _fresh_autocaptured):
+  monkeypatch.setattr(main, "DEDUPE_SIZE", 2)
+  _setup_ingest(monkeypatch)
+  for minute in range(5):
+    asyncio.run(main.ingest_signal(_ALERT, _BAR + timedelta(minutes=minute)))
+
+  assert len(main._autocaptured) == 2
+
+
+# ===================== fetch_alert_id / has_newer_alert =====================
+
+
+def test_fetch_alert_id_matches_exact_unique_key(monkeypatch):
+  conn = _FakeConn([[(42,)]])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  assert main.fetch_alert_id("FX:XAUUSD", "30S", _BAR) == 42
+  sql, params = conn.executed[0]
+  assert "bar_time = %s" in sql
+  assert "ORDER BY" not in sql
+  assert params == ("FX:XAUUSD", "30S", _BAR)
+
+
+def test_fetch_alert_id_none_when_missing(monkeypatch):
+  monkeypatch.setattr(main, "POOL", _FakePool(_FakeConn([[]])))
+
+  assert main.fetch_alert_id("FX:XAUUSD", "30S", _BAR) is None
+
+
+def test_has_newer_alert_true_and_false(monkeypatch):
+  conn = _FakeConn([[(1,)], []])
+  monkeypatch.setattr(main, "POOL", _FakePool(conn))
+
+  assert main.has_newer_alert("FX:XAUUSD", "30S", _BAR) is True
+  assert main.has_newer_alert("FX:XAUUSD", "30S", _BAR) is False
+  assert "bar_time > %s" in conn.executed[0][0]
+  assert conn.executed[0][1] == ("FX:XAUUSD", "30S", _BAR)
+
+
+# ===================== forward_autocapture: nilai balik "sudah dikonsultasi" =====================
+
+
+def test_forward_autocapture_returns_true_after_hermes_consulted(monkeypatch):
+  content = json.dumps({"decision": "no_trade", "confidence": 0.1})
+  _setup_autocapture(monkeypatch, enabled=True, hermes_content=content)
+
+  assert asyncio.run(main.forward_autocapture(_payload(), _BAR)) is True
+
+
+def test_forward_autocapture_returns_false_before_hermes(monkeypatch):
+  hermes, _ = _setup_autocapture(monkeypatch, enabled=True, has_open=True)
+
+  assert asyncio.run(main.forward_autocapture(_payload(), _BAR)) is False
+  hermes.assert_not_called()
+
+
+def test_forward_autocapture_returns_false_when_hermes_fails(monkeypatch):
+  _setup_autocapture(monkeypatch, enabled=True, hermes_exc=RuntimeError("down"))
+
+  assert asyncio.run(main.forward_autocapture(_payload(), _BAR)) is False
 
 
 # ===================== async DB audit: migrate() via asyncio.to_thread =====================
 
 
 def test_migrate_is_sync_callable():
-    # migrate() harus fungsi sinkron (bukan coroutine) supaya aman dipakai asyncio.to_thread.
-    import inspect
-    assert not inspect.iscoroutinefunction(main.migrate)
+  # migrate() harus fungsi sinkron (bukan coroutine) supaya aman dipakai asyncio.to_thread.
+  import inspect
+  assert not inspect.iscoroutinefunction(main.migrate)
 
 
-def test_lifespan_calls_migrate_via_to_thread(monkeypatch):
-    # Verifikasi lifespan tidak memanggil migrate() langsung di event loop;
-    # ia harus lewat asyncio.to_thread supaya event loop tidak ke-block saat startup.
-    calls = []
+def test_lifespan_runs_migrate_off_the_event_loop_thread(monkeypatch):
+  # Bukti nyata (bukan sekadar "terpanggil"): migrate harus jalan di thread BERBEDA
+  # dari thread event loop. Kalau lifespan memanggil migrate() langsung, test ini gagal.
+  import threading
+  seen = {}
 
-    # Patch migrate dan POOL agar tidak butuh koneksi nyata
-    monkeypatch.setattr(main, "migrate", lambda: calls.append("migrate"))
-    monkeypatch.setattr(main.POOL, "open", lambda: None)
-    monkeypatch.setattr(main.POOL, "close", lambda: None)
-    monkeypatch.setattr(main, "SCHEDULER", type("FakeSched", (), {
-        "add_job": lambda *a, **k: None,
-        "start": lambda self: None,
-        "shutdown": lambda self: None,
-    })())
+  monkeypatch.setattr(main, "migrate", lambda: seen.setdefault("migrate", threading.get_ident()))
+  monkeypatch.setattr(main.POOL, "open", lambda: None)
+  monkeypatch.setattr(main.POOL, "close", lambda: None)
+  monkeypatch.setattr(main, "SCHEDULER", type("FakeSched", (), {
+    "add_job": lambda *a, **k: None,
+    "start": lambda self: None,
+    "shutdown": lambda self: None,
+  })())
 
-    async def _run():
-        async with main.lifespan(main.app):
-            pass
+  async def _run():
+    seen["loop"] = threading.get_ident()
+    async with main.lifespan(main.app):
+      pass
 
-    asyncio.run(_run())
-    assert "migrate" in calls, "migrate harus dipanggil saat startup lifespan"
+  asyncio.run(_run())
+  assert "migrate" in seen, "migrate harus dipanggil saat startup lifespan"
+  assert seen["migrate"] != seen["loop"], "migrate tidak boleh jalan di thread event loop"
