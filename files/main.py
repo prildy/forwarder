@@ -125,7 +125,9 @@ class Signal(_Base):
     timeframe: str
     bar_time: datetime
     bar_time_ms: int
-    triggers: list[str] = Field(min_length=1)
+    # Key wajib ada, tapi list boleh kosong: bar tanpa trigger tetap disimpan
+    # (mode "Every bar close"); bar kosong tidak pernah diteruskan ke Hermes.
+    triggers: list[str]
     candle: Candle
     liquidity_pools: LiquidityPools
     smc: Smc

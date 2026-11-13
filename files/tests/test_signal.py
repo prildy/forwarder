@@ -95,7 +95,6 @@ def test_signal_missing_required_key(key):
 @pytest.mark.parametrize("key,value", [
   ("source", "binance"),
   ("event_id", ""),
-  ("triggers", []),
   ("bar_time", "bukan-tanggal"),
   ("bar_time_ms", "abc"),
   ("bbma", []),
@@ -107,6 +106,22 @@ def test_signal_bad_values(key, value):
   with pytest.raises(ValidationError) as ei:
     main.Signal.model_validate(p)
   assert key in _locs(ei.value)
+
+
+def test_signal_empty_triggers_accepted():
+  # Bar tanpa trigger (Every bar close) valid; key tetap wajib.
+  p = _valid()
+  p["triggers"] = []
+  s = main.Signal.model_validate(p)
+  assert s.triggers == []
+
+
+def test_signal_missing_triggers_key_still_rejected():
+  p = _valid()
+  del p["triggers"]
+  with pytest.raises(ValidationError) as ei:
+    main.Signal.model_validate(p)
+  assert "triggers" in _locs(ei.value)
 
 
 @pytest.mark.parametrize("patch", [
@@ -212,6 +227,22 @@ def test_webhook_happy_path_strips_secret(env, monkeypatch):
   assert "secret" not in forwarded
   assert forwarded["event_id"] == p["event_id"]
   assert bar_time.year == 2024
+
+
+def test_webhook_empty_triggers_accepted_and_ingested(env, monkeypatch):
+  client, records = env
+  ingest = AsyncMock()
+  monkeypatch.setattr(main, "ingest_signal", ingest)
+  monkeypatch.setattr(main, "already_seen", lambda event_id: False)
+  p = _valid()
+  p["triggers"] = []
+  r = client.post(_url(), content=json.dumps(p))
+  assert r.status_code == 200
+  assert r.json() == {"status": "accepted", "event_id": p["event_id"]}
+  ingest.assert_awaited_once()
+  forwarded, _ = ingest.await_args.args
+  assert forwarded["triggers"] == []
+  assert not [1 for name, _ in records if name == "rejected"]
 
 
 def test_webhook_duplicate_not_ingested(env, monkeypatch):

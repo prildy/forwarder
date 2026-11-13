@@ -302,6 +302,18 @@ def test_forward_autocapture_enabled_valid_long_creates_entry(monkeypatch):
   assert args[9] is None       # analysis_id
 
 
+def test_forward_autocapture_empty_triggers_never_calls_hermes(monkeypatch):
+  # Bar tanpa trigger: tak ada panggilan Hermes dan tak ada jurnal.
+  assert main._triggers_qualify([]) is False
+  hermes, create = _setup_autocapture(monkeypatch, enabled=True)
+  payload = _payload()
+  payload["triggers"] = []
+  asyncio.run(main.forward_autocapture(payload, datetime.now(timezone.utc)))
+
+  hermes.assert_not_called()
+  create.assert_not_called()
+
+
 def test_forward_autocapture_below_min_confidence_no_capture(monkeypatch):
   content = json.dumps({
       "decision": "long", "entry": 100, "stop_loss": 99, "take_profit": 102,
