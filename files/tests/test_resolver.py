@@ -316,3 +316,159 @@ def test_pricebar_close_defaults_to_none():
 ])
 def test_classify_r_boundaries(r, expected):
   assert resolver.classify_r(r) == expected
+
+
+# --- M3: model fill entry ---
+
+def test_fill_on_bar2_then_tp_on_bar3_long():
+  bars = [_bar(1, high=99.5, low=99), _bar(2, high=100.5, low=99.5),
+          _bar(3, high=102, low=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True)
+  assert res.status == "win"
+  assert res.filled_at == T0 + timedelta(minutes=2)
+  assert res.closed_at == T0 + timedelta(minutes=3)
+
+
+def test_fill_on_bar2_then_tp_on_bar3_short():
+  bars = [_bar(1, high=101, low=100.5), _bar(2, high=100.5, low=99.5),
+          _bar(3, high=100, low=98)]
+  res = resolve("short", Decimal("100"), Decimal("102"), Decimal("98"), bars,
+                require_fill=True)
+  assert res.status == "win"
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_fill_bar_also_touches_sl_is_loss_long():
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"),
+                [_bar(1, high=101, low=97.5)], require_fill=True)
+  assert res.status == "loss"
+  assert res.exit_reason == "sl"
+  assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+def test_fill_bar_also_touches_sl_is_loss_short():
+  res = resolve("short", Decimal("100"), Decimal("102"), Decimal("98"),
+                [_bar(1, high=102.5, low=99)], require_fill=True)
+  assert res.status == "loss"
+  assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+def test_fill_bar_touching_only_tp_stays_open_long():
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"),
+                [_bar(1, high=103, low=99.5)], require_fill=True)
+  assert res.is_open
+  assert res.status == "open"
+  assert res.filled_at == T0 + timedelta(minutes=1)
+  assert res.r_multiple is None and res.exit_price is None
+
+
+def test_fill_bar_touching_only_tp_stays_open_short():
+  res = resolve("short", Decimal("100"), Decimal("102"), Decimal("98"),
+                [_bar(1, high=100.5, low=97)], require_fill=True)
+  assert res.is_open
+  assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+def test_tp_on_bar_after_fill_bar_counts():
+  bars = [_bar(1, high=103, low=99.5), _bar(2, high=103, low=100.5)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True)
+  assert res.status == "win"
+  assert res.closed_at == T0 + timedelta(minutes=2)
+  assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+def test_tie_after_fill_is_loss():
+  bars = [_bar(1, high=100.5, low=99.5), _bar(2, high=103, low=97)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True)
+  assert res.status == "loss"
+  assert res.filled_at == T0 + timedelta(minutes=1)
+
+
+def test_never_filled_within_max_fill_bars_is_skipped():
+  bars = [_bar(i, high=105, low=104) for i in range(1, 6)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True, max_fill_bars=3)
+  assert res.status == "skipped"
+  assert res.exit_reason == "no_fill"
+  assert res.closed_at == T0 + timedelta(minutes=3)
+  assert res.exit_price is None and res.r_multiple is None
+  assert not res.is_open
+
+
+def test_fill_on_last_allowed_bar_is_not_skipped():
+  bars = [_bar(1, high=105, low=104), _bar(2, high=105, low=104),
+          _bar(3, high=101, low=99.5)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True, max_fill_bars=3)
+  assert res.status == "open"
+  assert res.filled_at == T0 + timedelta(minutes=3)
+
+
+def test_gap_down_across_entry_fills_long():
+  # bar1 seluruhnya di atas entry, bar2 seluruhnya di bawah → entry terlewati.
+  bars = [_bar(1, high=102, low=101), _bar(2, high=99.5, low=99)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"), bars,
+                require_fill=True)
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_gap_up_across_entry_fills_short():
+  bars = [_bar(1, high=99, low=98.5), _bar(2, high=101.5, low=101)]
+  res = resolve("short", Decimal("100"), Decimal("103"), Decimal("97"), bars,
+                require_fill=True)
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_gap_fill_bar_that_hits_stop_is_loss():
+  bars = [_bar(1, high=102, low=101), _bar(2, high=99.5, low=97)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"), bars,
+                require_fill=True)
+  assert res.status == "loss"
+  assert res.filled_at == T0 + timedelta(minutes=2)
+
+
+def test_none_bars_not_counted_for_fill_limit():
+  bars = [_bar(1, high=105, low=104), _bar(2), _bar(3, high=105, low=104),
+          _bar(4), _bar(5, high=105, low=104)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), bars,
+                require_fill=True, max_fill_bars=3)
+  assert res.status == "skipped"
+  assert res.closed_at == T0 + timedelta(minutes=5)
+
+
+def test_none_bar_does_not_break_gap_detection():
+  bars = [_bar(1, high=102, low=101), _bar(2), _bar(3, high=99.5, low=99)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"), bars,
+                require_fill=True)
+  assert res.filled_at == T0 + timedelta(minutes=3)
+
+
+def test_require_fill_no_bars_returns_open_sentinel():
+  assert resolve("long", Decimal("100"), Decimal("98"), Decimal("102"), [],
+                 require_fill=True) is resolver.OPEN
+
+
+def test_require_fill_never_touched_no_max_returns_open_sentinel():
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("102"),
+                [_bar(1, high=105, low=104)], require_fill=True)
+  assert res is resolver.OPEN
+
+
+def test_require_fill_false_ignores_max_fill_bars():
+  bars = [_bar(i, high=105, low=104) for i in range(1, 6)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104.5"), bars,
+                max_fill_bars=2)
+  assert res.status == "win"
+  assert res.filled_at is None
+
+
+def test_fill_with_cost_closed_result_carries_filled_at_and_net_r():
+  bars = [_bar(1, high=100.5, low=99.5), _bar(2, high=104, low=100)]
+  res = resolve("long", Decimal("100"), Decimal("98"), Decimal("104"), bars,
+                cost=Decimal("0.4"), require_fill=True)
+  assert res.gross_r == Decimal("2")
+  assert res.r_multiple == Decimal("1.8")
+  assert res.filled_at == T0 + timedelta(minutes=1)

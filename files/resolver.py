@@ -75,7 +75,8 @@ def classify_r(r: Decimal) -> str:
 
 def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
             take_profit: Decimal, bars: Iterable[PriceBarLike], *,
-            cost: Decimal = Decimal(0)) -> Resolution:
+            cost: Decimal = Decimal(0), require_fill: bool = False,
+            max_fill_bars: Optional[int] = None) -> Resolution:
   """Resolusi satu trade terhadap deretan bar yang SUDAH terurut waktu naik.
 
   `bars` wajib hanya berisi bar SETELAH entry (pemfilteran bar_time > opened_at adalah
@@ -84,6 +85,11 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
 
   `cost` = biaya round-trip dalam satuan harga (spread + slippage kedua sisi); dikurangkan
   dari R sebesar cost/risk. Status tetap ditentukan level yang tersentuh.
+
+  `require_fill=True` → entry dianggap limit order: trade baru berjalan setelah harga
+  menyentuh/melompati entry. Di bar fill hanya SL yang dicek (worst-case, TP tak pernah
+  dikreditkan di bar fill). Bar tanpa high/low dilewati dan tidak dihitung.
+  `max_fill_bars` → batas jumlah bar (terhitung) menunggu fill; lewat batas → 'skipped'.
   """
   if cost < 0:
     raise ValueError("cost tidak boleh negatif")
@@ -92,9 +98,30 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
   if risk == 0:
     return OPEN
 
+  filled = not require_fill
+  filled_at: Optional[datetime] = None
+  counted = 0   # jumlah bar terhitung (high & low ada), dipakai untuk batas fill
+  prev = None   # bar terhitung sebelumnya, untuk deteksi lompatan (gap) melewati entry
+
   for bar in bars:
     if bar.high is None or bar.low is None:
       continue
+    counted += 1
+    prev_bar, prev = prev, bar
+    fill_bar = False
+
+    if not filled:
+      touched = bar.low <= entry <= bar.high
+      gapped = prev_bar is not None and (
+        (prev_bar.high < entry and bar.low > entry)
+        or (prev_bar.low > entry and bar.high < entry))
+      if touched or gapped:
+        filled, fill_bar, filled_at = True, True, bar.bar_time
+      else:
+        if max_fill_bars is not None and counted >= max_fill_bars:
+          return Resolution(status="skipped", exit_price=None, r_multiple=None,
+                            closed_at=bar.bar_time, exit_reason="no_fill")
+        continue
 
     if direction == "long":
       hit_tp = bar.high >= take_profit
@@ -102,6 +129,10 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
     else:  # short
       hit_tp = bar.low <= take_profit
       hit_sl = bar.high >= stop_loss
+
+    # Di bar fill urutan intrabar tak diketahui → TP tak pernah dikreditkan.
+    if fill_bar:
+      hit_tp = False
 
     if not hit_tp and not hit_sl:
       continue
@@ -119,7 +150,11 @@ def resolve(direction: str, entry: Decimal, stop_loss: Decimal,
     # Bar pertama yang menyentuh level menentukan hasil.
     return Resolution(status=status, exit_price=exit_price,
                       r_multiple=r_multiple, closed_at=bar.bar_time,
-                      gross_r=gross_r, exit_reason="sl" if hit_sl else "tp")
+                      gross_r=gross_r, filled_at=filled_at,
+                      exit_reason="sl" if hit_sl else "tp")
 
-  # Tak ada bar yang menyentuh di history yang tersedia → tetap open.
+  # Sudah terisi tapi belum tersentuh level → open dengan filled_at; belum terisi → OPEN.
+  if filled_at is not None:
+    return Resolution(status="open", exit_price=None, r_multiple=None,
+                      closed_at=None, filled_at=filled_at)
   return OPEN
