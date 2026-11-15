@@ -9,6 +9,7 @@
 # Re-include the shared config (agents + permissions); keep local-only overrides out.
 !.claude/
 .claude/settings.local.json
+.claude/worktrees/
 
 # Python bytecode
 __pycache__/

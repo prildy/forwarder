@@ -8,7 +8,7 @@ import html
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
 from psycopg import errors as pg_errors
@@ -125,7 +125,10 @@ class Signal(_Base):
     timeframe: str
     bar_time: datetime
     bar_time_ms: int
-    triggers: list[str] = Field(min_length=1)
+    # Key wajib ada, list boleh kosong: bar tanpa trigger tetap disimpan untuk
+    # riwayat harga (resolver/backtest). Auto-capture melewati bar kosong, dan
+    # analisis manual memakai fetch_latest_alert(require_trigger=True).
+    triggers: list[Annotated[str, Field(min_length=1)]]
     candle: Candle
     liquidity_pools: LiquidityPools
     smc: Smc
@@ -161,18 +164,26 @@ class ForwardTradeExists(Exception):
 # --- Dedupe berdasarkan event_id (in-memory, cukup untuk 1 instance) ---
 _seen: "OrderedDict[str, None]" = OrderedDict()
 
+# Bar (symbol, tf, bar_time) yang sudah/sedang dikonsultasikan ke Hermes. Dipakai supaya
+# satu bar tidak memicu dua panggilan Hermes, tapi bar yang gagal/terlewat boleh dicoba lagi.
+_autocaptured: "OrderedDict[tuple, None]" = OrderedDict()
+
 def migrate():
     with POOL.connection() as conn, open("schema.sql") as f:
         conn.execute(f.read())
 
-def save_alert(p: dict, bar_time: datetime):
+def save_alert(p: dict, bar_time: datetime) -> bool:
+    # Kembalikan True jika baris baru diinsert, False jika konflik (bar sudah ada).
+    # psycopg set rowcount=0 saat DO NOTHING menyerap baris, 1 saat insert berhasil.
+    # Hanya informatif: ingest_signal sengaja TIDAK memakainya sebagai gate.
     with POOL.connection() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """INSERT INTO alerts (symbol, timeframe, bar_time, payload)
                VALUES (%s, %s, %s, %s)
                ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING""",
             (p["symbol"], p["timeframe"], bar_time, Jsonb(p)),
         )
+        return cursor.rowcount == 1
 
 def save_analysis(alert: dict, symbol: str, timeframe: str, content: str,
                   latency_s: float, trigger_src: str) -> None:
@@ -252,6 +263,11 @@ def already_seen(event_id: str) -> bool:
     return False
 
 
+def forget_event(event_id: str) -> None:
+    # Lupakan event_id supaya replay alert yang gagal disimpan tidak dibuang sbg duplikat.
+    _seen.pop(event_id, None)
+
+
 def append_jsonl(name: str, record: dict) -> None:
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with open(LOG_DIR / f"{name}-{day}.jsonl", "a", encoding="utf-8") as f:
@@ -265,17 +281,43 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-def fetch_latest_alert(symbol: str, timeframe: str) -> dict | None:
+def fetch_latest_alert(symbol: str, timeframe: str, *, require_trigger: bool = False) -> dict | None:
+    # require_trigger=True: lewati bar tanpa trigger (disimpan untuk riwayat harga),
+    # supaya analisis manual memakai sinyal nyata terakhir.
+    trigger_filter = "AND jsonb_array_length(payload->'triggers') > 0" if require_trigger else ""
     with POOL.connection() as conn:
         row = conn.execute(
-            """SELECT id, payload, bar_time FROM alerts
-               WHERE symbol = %s AND timeframe = %s
+            f"""SELECT id, payload, bar_time FROM alerts
+               WHERE symbol = %s AND timeframe = %s {trigger_filter}
                ORDER BY bar_time DESC LIMIT 1""",
             (symbol, timeframe),
         ).fetchone()
     if not row:
         return None
     return {"id": row[0], "payload": row[1], "bar_time": row[2]}
+
+
+def fetch_alert_id(symbol: str, timeframe: str, bar_time: datetime) -> int | None:
+    # Cocokkan persis pada unique key alerts — bukan "alert terbaru" — supaya jurnal
+    # untuk bar yang telat tidak tertaut ke alert bar yang lebih baru.
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT id FROM alerts
+               WHERE symbol = %s AND timeframe = %s AND bar_time = %s""",
+            (symbol, timeframe, bar_time),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def has_newer_alert(symbol: str, timeframe: str, bar_time: datetime) -> bool:
+    # True jika sudah ada bar yang lebih baru dari bar_time (bar ini datang terlambat).
+    with POOL.connection() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM alerts
+               WHERE symbol = %s AND timeframe = %s AND bar_time > %s LIMIT 1""",
+            (symbol, timeframe, bar_time),
+        ).fetchone()
+    return row is not None
 
 # ===================== Trade journal (DB helpers) =====================
 # Semua fungsi di sini sinkron (pakai POOL) → dipanggil lewat asyncio.to_thread.
@@ -384,7 +426,15 @@ def resolve_open_trades() -> int:
 
             bars = [resolver.PriceBar(bar_time=row[0], high=row[1], low=row[2])
                     for row in bar_rows]
-            outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
+            try:
+                outcome = resolver.resolve(direction, entry, stop_loss, take_profit, bars)
+            except ValueError:
+                # Level terbalik (mis. /journal long dengan sl > entry): resolver menolaknya.
+                # Satu baris rusak tidak boleh menghentikan resolusi trade lain di loop ini.
+                log.warning("journal %s: level tidak valid (%s e=%s sl=%s tp=%s), "
+                            "lewati auto-resolve", journal_id, direction, entry,
+                            stop_loss, take_profit)
+                continue
 
             if outcome.is_open:
                 # Risk nol (entry == sl) di-guard resolver jadi open — catat biar kelihatan.
@@ -446,7 +496,7 @@ def journal_stats(symbol: str, mode: str) -> dict:
 async def run_hermes_analysis(symbol: str = DEFAULT_SYMBOL, timeframe: str = DEFAULT_TF,
                               trigger_src: str = "api") -> dict:
     # fungsi DB sync → jalankan di thread supaya event loop tidak ke-block
-    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe, require_trigger=True)
     if not alert:
         raise LookupError(f"Belum ada alert untuk {symbol}/{timeframe}")
 
@@ -480,65 +530,76 @@ def _levels_sane(direction: str, entry: float, stop_loss: float, take_profit: fl
     return take_profit < entry < stop_loss
 
 
-async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
+async def forward_autocapture(payload: dict, bar_time: datetime) -> bool:
     """Hermes-driven forward test: dari satu signal live, minta keputusan ke Hermes,
     lalu kalau layak buat jurnal mode='forward' yang nanti ditutup resolver 1 menit.
 
     Seluruh badan dibungkus try/except: kegagalan apa pun (Hermes mati, parse jelek)
     dicatat lalu ditelan — tidak boleh mengganggu ingesti webhook.
+
+    Return True hanya jika Hermes sudah berhasil dikonsultasi untuk bar ini; skip sebelum
+    Hermes (gate, trigger, trade open) atau Hermes gagal → False, supaya bar boleh dicoba lagi.
     """
     if not FORWARD_AUTOCAPTURE:
-        return
+        return False
 
+    consulted = False
     try:
         symbol = payload.get("symbol")
         timeframe = payload.get("timeframe")
         # Gate instrumen utama: forward-capture hanya untuk DEFAULT_SYMBOL/DEFAULT_TF.
         if symbol != DEFAULT_SYMBOL or timeframe != DEFAULT_TF:
             log.debug("autocapture skip: symbol/tf bukan primary (%s/%s)", symbol, timeframe)
-            return
+            return False
 
         triggers = payload.get("triggers") or []
         if not _triggers_qualify(triggers):
             log.debug("autocapture skip: triggers tidak memenuhi filter (%s)", triggers)
-            return
+            return False
+
+        # Bar telat (out-of-order): sudah ada bar lebih baru → keputusan untuk bar ini basi.
+        # Dicek SETELAH gate murah di atas supaya bar kosong/non-primary tidak kena query DB.
+        if await asyncio.to_thread(has_newer_alert, symbol, timeframe, bar_time):
+            log.info("autocapture skip: bar %s %s/%s sudah tertinggal bar yang lebih baru",
+                     bar_time, symbol, timeframe)
+            return False
 
         # Anti-pyramiding: satu forward trade open per symbol+tf.
         if await asyncio.to_thread(has_open_forward_trade, symbol, timeframe):
             log.info("autocapture skip: masih ada forward trade open %s/%s", symbol, timeframe)
-            return
+            return False
 
         received_at = datetime.now(timezone.utc).isoformat()
         content, _ = await forward_to_hermes(payload, received_at)
+        consulted = True
         decision = parse_hermes_decision(content)
         if decision is None:
             log.info("autocapture skip: respons Hermes tak terparse jadi keputusan")
-            return
+            return True
 
         if decision["decision"] not in ("long", "short"):
             log.info("autocapture skip: decision=%s (no_trade)", decision["decision"])
-            return
+            return True
 
         if decision["confidence"] < FORWARD_MIN_CONFIDENCE:
             log.info("autocapture skip: confidence %.2f < %.2f",
                      decision["confidence"], FORWARD_MIN_CONFIDENCE)
-            return
+            return True
 
         entry = decision["entry"]
         stop_loss = decision["stop_loss"]
         take_profit = decision["take_profit"]
         if entry is None or stop_loss is None or take_profit is None:
             log.info("autocapture skip: level entry/sl/tp tidak lengkap")
-            return
+            return True
 
         if not _levels_sane(decision["decision"], entry, stop_loss, take_profit):
             log.info("autocapture skip: level tidak masuk akal utk %s (e=%s sl=%s tp=%s)",
                      decision["decision"], entry, stop_loss, take_profit)
-            return
+            return True
 
-        # Tautkan alert terbaru (yang baru saja disimpan) sebagai konteks jurnal.
-        alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
-        alert_id = alert["id"] if alert else None
+        # Tautkan alert milik bar ini (cocok persis unique key) sebagai konteks jurnal.
+        alert_id = await asyncio.to_thread(fetch_alert_id, symbol, timeframe, bar_time)
 
         setup_tags = decision["setup_tags"] or list(triggers)
         journal_id = await asyncio.to_thread(
@@ -548,18 +609,57 @@ async def forward_autocapture(payload: dict, bar_time: datetime) -> None:
         log.info("autocapture: jurnal forward #%s dibuat %s e=%s sl=%s tp=%s conf=%.2f",
                  journal_id, decision["decision"], entry, stop_loss, take_profit,
                  decision["confidence"])
+        return True
     except ForwardTradeExists:
         # Race: webhook lain sudah buka forward trade duluan (unique index menolak).
         log.info("autocapture skip: sudah ada forward trade terbuka, lewati")
+        return True
     except Exception:  # noqa: BLE001
         log.exception("autocapture gagal (diabaikan, webhook tetap aman)")
+        return consulted
 
 
 async def ingest_signal(payload: dict, bar_time: datetime) -> None:
     # Satu background task: simpan alert dulu (supaya id-nya ada), baru auto-capture
     # yang melihat alert tsb. Urutan ini menghindari race antara save & lookup.
-    await asyncio.to_thread(save_alert, payload, bar_time)
-    await forward_autocapture(payload, bar_time)
+    # Desain: SATU alert per bar. Hasil save_alert (insert vs ON CONFLICT) sengaja tidak
+    # dipakai sebagai gate; duplikat bar dicegah oleh guard _autocaptured di bawah.
+    # Catatan: kalau dua alert berbeda tiba untuk bar yang sama, ON CONFLICT DO NOTHING
+    # membuang payload kedua (trigger-nya tidak tersimpan) — itu di luar desain ini.
+    try:
+        await asyncio.to_thread(save_alert, payload, bar_time)
+    except Exception as e:
+        # Save gagal: lupakan event_id (agar replay diterima), catat error, jangan re-raise.
+        event_id = payload.get("event_id")
+        forget_event(event_id)
+        log.exception("save_alert gagal event=%s", event_id)
+        try:
+            append_jsonl("errors", {"event_id": event_id, "error": repr(e)})
+        except Exception:
+            log.exception("gagal menulis errors log event=%s", event_id)
+        return
+
+    symbol = payload.get("symbol")
+    timeframe = payload.get("timeframe")
+
+    # Satu bar = satu konsultasi Hermes. Key ditandai sebelum await (cegah race dua
+    # task paralel) dan dilepas lagi bila Hermes belum berhasil dikonsultasi, jadi
+    # kegagalan/skip pra-Hermes tidak mengunci bar itu selamanya.
+    key = (symbol, timeframe, bar_time)
+    if key in _autocaptured:
+        log.info("ingest skip: bar %s %s/%s sudah dikonsultasikan ke Hermes",
+                 bar_time, symbol, timeframe)
+        return
+    _autocaptured[key] = None
+    if len(_autocaptured) > DEDUPE_SIZE:
+        _autocaptured.popitem(last=False)
+
+    consulted = False
+    try:
+        consulted = await forward_autocapture(payload, bar_time)
+    finally:
+        if not consulted:
+            _autocaptured.pop(key, None)
 
 
 def cleanup_old_data():
@@ -611,8 +711,8 @@ async def forward_to_hermes(payload: dict, received_at: str) -> tuple[str, float
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     POOL.open()
-    migrate()     
-    
+    await asyncio.to_thread(migrate)  # migrasi DB di thread supaya event loop tidak ke-block
+
     SCHEDULER.add_job(cleanup_old_data, "cron", hour=2, minute=0)  # 09:00 WIB
     # Resolver tiap 1 menit: cocok untuk TF scalping 30S, bar baru cepat ketahuan.
     SCHEDULER.add_job(_resolve_job, "interval", minutes=1)
@@ -685,7 +785,7 @@ async def analyze(token: str, bg: BackgroundTasks,
     if not hmac.compare_digest(token.encode(), ANALYZE_SECRET.encode()):
         raise HTTPException(status_code=404)
 
-    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe)
+    alert = await asyncio.to_thread(fetch_latest_alert, symbol, timeframe, require_trigger=True)
     if not alert:
         raise HTTPException(404, f"Belum ada alert untuk {symbol}/{timeframe}")
     age_min = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
@@ -813,8 +913,10 @@ async def tg_cmd_journal(chat_id: int, args: list[str]) -> None:
     elif direction == "short" and not (take_profit < entry < stop_loss):
         warn = "\n⚠️ Catatan: untuk short normalnya tp < entry < sl."
 
-    # Tautkan alert terbaru sebagai konteks; analysis_id dibiarkan NULL dulu.
-    alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
+    # Tautkan alert ber-trigger terakhir (sinyal yang di-trade), bukan bar harga kosong;
+    # analysis_id dibiarkan NULL dulu.
+    alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF,
+                                    require_trigger=True)
     alert_id = alert["id"] if alert else None
 
     try:
@@ -962,10 +1064,21 @@ async def telegram_webhook(request: Request, bg: BackgroundTasks):
     elif cmd == "/status":
         alert = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF)
         if alert:
-            age = (datetime.now(timezone.utc) - alert["bar_time"]).total_seconds() / 60
-            await tg_send(chat_id, f"Alert terakhir {DEFAULT_SYMBOL} {DEFAULT_TF}: "
-                                   f"{alert['bar_time'].isoformat()} ({age:.0f} mnt lalu)",
-                          reply_markup=analyze_button())
+            now = datetime.now(timezone.utc)
+            age = (now - alert["bar_time"]).total_seconds() / 60
+            text = (f"Alert terakhir {DEFAULT_SYMBOL} {DEFAULT_TF}: "
+                    f"{alert['bar_time'].isoformat()} ({age:.0f} mnt lalu)")
+            # Bar tanpa trigger ikut tersimpan → tampilkan juga sinyal terakhir, supaya
+            # status "segar" tidak menutupi sinyal yang sudah lama (cocok dengan /analyze).
+            signal = await asyncio.to_thread(fetch_latest_alert, DEFAULT_SYMBOL, DEFAULT_TF,
+                                             require_trigger=True)
+            if signal:
+                sig_age = (now - signal["bar_time"]).total_seconds() / 60
+                text += (f"\nSinyal terakhir: {signal['bar_time'].isoformat()} "
+                         f"({sig_age:.0f} mnt lalu)")
+            else:
+                text += "\nSinyal terakhir: belum ada"
+            await tg_send(chat_id, text, reply_markup=analyze_button())
         else:
             await tg_send(chat_id, "Belum ada alert tersimpan.")
     elif cmd == "/journal":
